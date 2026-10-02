@@ -163,11 +163,18 @@ class _LiveHeaderControlState extends State<LiveHeaderControl>
               ),
               onTap: widget.onSendDanmaku,
             ),
-          if (Platform.isAndroid || (PlatformUtils.isDesktop && !isFullScreen))
+          if (Platform.isAndroid ||
+              (Platform.isIOS && !isFullScreen) ||
+              (PlatformUtils.isDesktop && !isFullScreen))
             ComBtn(
               height: btnHeight,
               tooltip: '画中画',
               onTap: () {
+                if (Platform.isIOS) {
+                  // iOS：系统级画中画（可悬浮于其它 App 之上）
+                  plPlayerController.toggleIOSPip();
+                  return;
+                }
                 if (PlatformUtils.isDesktop) {
                   plPlayerController.toggleDesktopPip();
                   return;

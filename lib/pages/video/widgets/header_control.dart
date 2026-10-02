@@ -1930,6 +1930,7 @@ class HeaderControlState extends State<HeaderControl>
                   ),
                 ),
                 if (Platform.isAndroid ||
+                    (Platform.isIOS && !isFullScreen) ||
                     (PlatformUtils.isDesktop && !isFullScreen))
                   SizedBox(
                     width: btnWidth,
@@ -1938,6 +1939,11 @@ class HeaderControlState extends State<HeaderControl>
                       tooltip: '画中画',
                       style: btnStyle,
                       onPressed: () {
+                        if (Platform.isIOS) {
+                          // iOS：系统级画中画（可悬浮于其它 App 之上）
+                          plPlayerController.toggleIOSPip();
+                          return;
+                        }
                         if (PlatformUtils.isDesktop) {
                           plPlayerController.toggleDesktopPip();
                           return;

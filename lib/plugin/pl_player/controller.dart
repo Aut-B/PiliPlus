@@ -1,4 +1,4 @@
-import 'dart:async' show StreamSubscription, Timer;
+import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -201,6 +201,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       (Platform.isAndroid && AndroidHelper.isPipMode) ||
       (PlatformUtils.isDesktop && isDesktopPip);
   late bool isDesktopPip = false;
+  /// iOS 是否处于系统级画中画（由原生侧事件驱动）。
+  final RxBool isIOSPip = false.obs;
   late Rect _lastWindowBounds;
   static Rect? _lastPipBounds;
 
@@ -317,6 +319,129 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       exitDesktopPip();
     } else {
       enterDesktopPip();
+    }
+  }
+
+  /// 是否为 iOS 画中画额外持有一份播放器引用。
+  ///
+  /// 进入画中画时 +1、退出时 -1，保证离开视频页后播放器不被销毁。
+  bool _iosPipHold = false;
+
+  StreamSubscription<String>? _iosPipSub;
+
+  void _listenIOSPip() {
+    _iosPipSub ??= PictureInPicture.events.listen((event) {
+      switch (event) {
+        case 'start':
+          isIOSPip.value = true;
+          break;
+        case 'restore':
+          // 用户点击画中画窗口的「回到 App」：若视频页已被离开，重新打开。
+          isIOSPip.value = false;
+          _iosPipRestoring = _restorePipPage();
+          break;
+        case 'stop':
+          isIOSPip.value = false;
+          _releaseIOSPipHold();
+          break;
+      }
+    });
+  }
+
+  /// 「回到 App」后是否需要等待视频页重新挂载。
+  bool _iosPipRestoring = false;
+
+  void _releaseIOSPipHold() {
+    if (!_iosPipHold) return;
+    _iosPipHold = false;
+    // 「回到 App」时视频页需要一点时间重新挂载；若立刻回收，会出现
+    // 「页面刚打开、播放器已被销毁」。故延迟到页面挂载完成后再判断。
+    if (_iosPipRestoring) {
+      _iosPipRestoring = false;
+      Future<void>.delayed(
+        const Duration(milliseconds: 1200),
+        _doReleaseIOSPipHold,
+      );
+      return;
+    }
+    _doReleaseIOSPipHold();
+  }
+
+  void _doReleaseIOSPipHold() {
+    if (_playerCount > 1) {
+      _playerCount -= 1;
+    } else {
+      // 视频页已销毁，直接回收播放器
+      dispose();
+    }
+  }
+
+  /// 从画中画「回到 App」时重新打开视频页。返回是否在等待页面挂载。
+  bool _restorePipPage() {
+    try {
+      final route = Get.currentRoute;
+      if (route == '/videoV' || route == '/liveRoom') {
+        // 视频页仍在，系统会自行回到前台。
+        return false;
+      }
+      // 直播没有可复用的房间号，无法还原页面。
+      if (isLive) return false;
+      final bvid = _bvid;
+      final cid = this.cid;
+      if (bvid == null || cid == null) return false;
+      PageUtils.toVideoPage(
+        videoType: _videoType,
+        aid: _aid,
+        bvid: bvid,
+        cid: cid,
+        seasonId: _seasonId,
+        epId: _epid,
+        progress: positionInMilliseconds,
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// iOS 端系统级画中画。
+  ///
+  /// 画面由 media_kit 在 iOS 原生侧通过 `AVSampleBufferDisplayLayer` 送入系统
+  /// 画中画窗口（可悬浮于其它 App 之上，切后台 / 锁屏继续播放）。
+  /// 进入时额外持有一份播放器引用，保证离开视频页后播放器不被销毁，
+  /// 从而实现“边看边刷”；退出时释放该引用。
+  void enterIOSPip() {
+    if (!Platform.isIOS) return;
+    if (isFullScreen.value) return;
+    final videoController = this.videoController;
+    if (videoController == null) return;
+    _listenIOSPip();
+    if (!_iosPipHold) {
+      _iosPipHold = true;
+      _playerCount += 1;
+    }
+    isIOSPip.value = true;
+    unawaited(
+      videoController.setPictureInPicture(true).catchError((_) {
+        isIOSPip.value = false;
+        _releaseIOSPipHold();
+      }),
+    );
+  }
+
+  void exitIOSPip() {
+    if (!Platform.isIOS) return;
+    isIOSPip.value = false;
+    videoController?.setPictureInPicture(false);
+    _releaseIOSPipHold();
+  }
+
+  void toggleIOSPip() {
+    if (!Platform.isIOS) return;
+    if (isIOSPip.value) {
+      exitIOSPip();
+    } else {
+      enterIOSPip();
     }
   }
 
@@ -659,6 +784,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     bool autoFullScreenFlag = false,
   }) async {
     try {
+      // 有新的视频接管播放器时，先退出 iOS 画中画状态
+      if (isIOSPip.value) {
+        exitIOSPip();
+      }
       _processing = true;
       this.isLive = isLive;
       _videoType = videoType ?? VideoType.ugc;
@@ -1594,6 +1723,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     danmakuController = null;
     _stopOrientationListener();
     _disableAutoEnterPip();
+    _iosPipSub?.cancel();
+    _iosPipSub = null;
+    if (isIOSPip.value) {
+      videoController?.setPictureInPicture(false);
+      isIOSPip.value = false;
+    }
+    _iosPipHold = false;
     setPlayCallBack(null);
     dmState.clear();
     if (showSeekPreview) {
@@ -1746,7 +1882,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   void onPopInvokedWithResult(bool didPop, Object? result) {
     if (didPop) {
-      if (playerStatus.isPlaying) {
+      // iOS 画中画下离开视频页时保持播放
+      if (!isIOSPip.value && playerStatus.isPlaying) {
         pause();
       }
 
@@ -1764,6 +1901,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     if (controlsLock.value) {
       onLockControl(false);
+      return;
+    }
+    if (isIOSPip.value) {
+      // 未能真正退出页面时（如全屏/横屏拦截），先退出画中画避免卡在原页
+      exitIOSPip();
       return;
     }
     if (isDesktopPip) {
