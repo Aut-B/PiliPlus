@@ -166,28 +166,33 @@ class _LiveHeaderControlState extends State<LiveHeaderControl>
           if (Platform.isAndroid ||
               Platform.isIOS ||
               (PlatformUtils.isDesktop && !isFullScreen))
-            ComBtn(
-              height: btnHeight,
-              tooltip: '画中画',
-              onTap: () {
-                if (Platform.isIOS) {
-                  // iOS：系统级画中画（可悬浮于其它 App 之上）
-                  plPlayerController.toggleIOSPip();
-                  return;
-                }
-                if (PlatformUtils.isDesktop) {
-                  plPlayerController.toggleDesktopPip();
-                  return;
-                }
-                if (AndroidHelper.isPipAvailable) {
-                  plPlayerController.enterPip();
-                }
-              },
-              icon: const Icon(
-                size: 18,
-                Icons.picture_in_picture_outlined,
-                color: Colors.white,
-              ),
+            Obx(
+              () => Platform.isIOS &&
+                      !plPlayerController.isIOSPipSupported.value
+                  ? const SizedBox.shrink()
+                  : ComBtn(
+                      height: btnHeight,
+                      tooltip: '画中画',
+                      onTap: () {
+                        if (Platform.isIOS) {
+                          // iOS：系统级画中画（可悬浮于其它 App 之上）
+                          plPlayerController.toggleIOSPip();
+                          return;
+                        }
+                        if (PlatformUtils.isDesktop) {
+                          plPlayerController.toggleDesktopPip();
+                          return;
+                        }
+                        if (AndroidHelper.isPipAvailable) {
+                          plPlayerController.enterPip();
+                        }
+                      },
+                      icon: const Icon(
+                        size: 18,
+                        Icons.picture_in_picture_outlined,
+                        color: Colors.white,
+                      ),
+                    ),
             ),
           Obx(
             () => ComBtn(

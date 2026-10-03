@@ -212,6 +212,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// iOS 是否处于系统级画中画（由原生侧事件驱动）。
   final RxBool isIOSPip = false.obs;
 
+  /// 当前机型 / 系统是否支持系统级画中画（iOS）。
+  ///
+  /// 由原生侧的 `AVPictureInPictureController.isPictureInPictureSupported()` 判定，
+  /// 首次点到画中画时写入。旧机型上系统可能根本给不出这个功能，此时没必要让用户
+  /// 对着一个按不动的按钮反复点，直接隐藏更诚实。
+  final RxBool isIOSPipSupported = true.obs;
+
   /// iOS 下是否应由系统画中画接管后台播放。
   ///
   /// 画中画需要在后台继续渲染画面，因此这两种情形下不能因为「后台播放」开关
@@ -590,9 +597,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   bool _iosPipStartedEvent = false;
 
   void _doEnterIOSPip() {
+    unawaited(_doEnterIOSPipAsync());
+  }
+
+  Future<void> _doEnterIOSPipAsync() async {
     final videoController = this.videoController;
     if (videoController == null) return;
     _listenIOSPip();
+    // 先问一次系统是否支持。旧机型上系统可能根本给不出画中画，此时既没必要走
+    // 后面的流程，也不该让用户对着一个按不动的按钮反复点。
+    if (!await videoController.isPictureInPictureSupported()) {
+      isIOSPipSupported.value = false;
+      SmartDialog.showToast('当前机型不支持画中画（系统判定），已隐藏该按钮');
+      return;
+    }
     _syncIOSPipDanmaku(true);
     if (!_iosPipHold) {
       _iosPipHold = true;
@@ -610,23 +628,38 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _releaseIOSPipHold();
       }),
     );
-    // 诊断：若 2 秒后仍未真正进入画中画，说明系统拒绝了启动（例如画面源未被
-    // 判定为可见），把判断结果直接显示出来，便于在真机上定位。
-    unawaited(
-      Future<void>.delayed(const Duration(milliseconds: 2000), () async {
-        if (!isIOSPip.value || _iosPipStartedEvent) return;
-        final possible = await videoController.isPictureInPicturePossible();
-        if (!isIOSPip.value || _iosPipStartedEvent) return;
-        isIOSPip.value = false;
-        _releaseIOSPipHold();
-        SmartDialog.showToast(
-          possible ? '画中画启动被系统中断，请重试' : '画中画不可用：画面源未就绪',
-        );
-      }),
-    );
+    unawaited(_checkIOSPipStart(videoController));
     if (isLiveContainerMultitask) {
       unawaited(_reportIOSPipDiagnostics(videoController));
     }
+  }
+
+  /// 启动兜底检查。
+  ///
+  /// 原生侧在系统判定「画面源未就绪」时会重试一段时间（约 3 秒），失败后主动报出
+  /// 失败原因，正常情况下这里等不到结论。保留它，是为了兜住「系统连失败都不通知」
+  /// 的极端情形——那时至少还能把诊断读数摆出来，而不是让用户面对一次无声的点击。
+  Future<void> _checkIOSPipStart(VideoController videoController) async {
+    await Future<void>.delayed(const Duration(seconds: 4));
+    if (!isIOSPip.value || _iosPipStartedEvent) return;
+    final supported = await videoController.isPictureInPictureSupported();
+    if (!isIOSPip.value || _iosPipStartedEvent) return;
+    isIOSPip.value = false;
+    _releaseIOSPipHold();
+    if (!supported) {
+      isIOSPipSupported.value = false;
+      SmartDialog.showToast('当前机型不支持画中画（系统判定），已隐藏该按钮');
+      return;
+    }
+    final info = await videoController.pictureInPictureDiagnostics();
+    final attempt = (info['attempt'] as num?)?.toInt() ?? 0;
+    final enqueued = (info['enqueued'] as num?)?.toInt() ?? 0;
+    final notReady = (info['notReady'] as num?)?.toInt() ?? 0;
+    final layerStatus = info['layerStatus'] ?? '?';
+    SmartDialog.showToast(
+      '画中画启动失败：画面源未就绪'
+      '（出帧 $attempt、入队 $enqueued、图层拒收 $notReady、图层 $layerStatus）',
+    );
   }
 
   /// 真机排障：把画中画链路的诊断快照显示出来（仅多任务模式下调用）。
