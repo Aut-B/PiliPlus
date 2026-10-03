@@ -696,6 +696,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final hostAttached = info['hostAttached'] == true;
     final appState = info['appState'] ?? '?';
     final audioActive = info['audioActive'] == true;
+    final audioOther = info['audioOtherPlaying'] == true;
     final hostOrigin = info['hostOrigin'] ?? '?';
     final windowBounds = info['windowBounds'] ?? '?';
 
@@ -721,7 +722,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         '（小窗已显示 ${sinceShow < 0 ? '?' : sinceShow.toStringAsFixed(1)} 秒）\n'
         '降频丢弃 $throttled 次\n'
         '画面源　已挂入层级 $hostAttached，落点 $hostOrigin，窗口 $windowBounds\n'
-        'App 状态　$appState　·　音频会话活跃 $audioActive';
+        'App 状态　$appState　·　音频会话活跃 $audioActive'
+        '（另有音频在播放 $audioOther）';
 
     await SmartDialog.show(
       animationType: SmartAnimationType.centerFade_otherSlide,
