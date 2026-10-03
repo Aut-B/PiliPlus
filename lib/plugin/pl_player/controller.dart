@@ -357,6 +357,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 已「武装」自动画中画的 videoController，避免反复下发同一设置。
   Object? _iosAutoEnterArmedFor;
 
+  /// 上次下发的「后台画中画」开关值，与 [_iosAutoEnterArmedFor] 共同用于判重。
+  bool? _iosAutoEnterArmedValue;
+
+  /// 换源前画中画正在进行，换源后应接着播。
+  bool _resumeIOSPipAfterSourceChange = false;
+
   void _listenIOSPip() {
     _iosPipSub ??= PictureInPicture.events.listen((event) {
       switch (event) {
@@ -387,6 +393,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 启动失败时把原因显示出来，便于在真机上定位问题。
       isIOSPip.value = false;
       _releaseIOSPipHold();
+      // 失败后同样重新武装，让用户可以直接再试一次。
+      _syncIOSAutoEnterPip(force: true);
       SmartDialog.showToast(message);
     });
     _iosPipDanmakuSub ??= enableShowDanmaku.listen((_) {
@@ -398,12 +406,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// 武装后由系统在用户划回主屏幕（App 进入后台）时自动弹出画中画窗口，
   /// 无需手动点按按钮。
-  void _syncIOSAutoEnterPip() {
+  void _syncIOSAutoEnterPip({bool force = false}) {
     if (!Platform.isIOS) return;
     final videoController = this.videoController;
     if (videoController == null) return;
-    if (identical(_iosAutoEnterArmedFor, videoController)) return;
+    if (!force &&
+        identical(_iosAutoEnterArmedFor, videoController) &&
+        _iosAutoEnterArmedValue == autoPiP) {
+      return;
+    }
     _iosAutoEnterArmedFor = videoController;
+    _iosAutoEnterArmedValue = autoPiP;
     _listenIOSPip();
     videoController.setAutoEnterPictureInPicture(autoPiP);
     // 自动进入画中画时同样要有弹幕，故武装阶段就把弹幕数据接上。
@@ -604,6 +617,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _syncIOSPipDanmaku(autoPiP);
     videoController?.setPictureInPicture(false);
     _releaseIOSPipHold();
+    // 关掉小窗并不等于放弃画中画能力：重新武装一次，保证下一次点按钮或划回
+    // 主屏幕时系统仍然能立刻拿到画面（否则第二次进入的小窗会是黑屏）。
+    _syncIOSAutoEnterPip(force: true);
   }
 
   void toggleIOSPip() {
@@ -954,9 +970,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     bool autoFullScreenFlag = false,
   }) async {
     try {
-      // 有新的视频接管播放器时，先退出 iOS 画中画状态
-      if (isIOSPip.value) {
-        exitIOSPip();
+      // 连播下一集、换源、切清晰度都会走到这里。此时若画中画正在进行，不能把
+      // 小窗丢掉——在小窗里一路往下看正是这个功能的主要用法。这里只通知原生侧
+      // 清掉上一集的残留（图层内容、时间轴、弹幕），小窗会在新视频第一帧到来后
+      // 无缝接上，而不是停在黑屏。
+      if (Platform.isIOS) {
+        if (isIOSPip.value) {
+          _resumeIOSPipAfterSourceChange = true;
+        }
+        final pipVideoController = videoController;
+        if (pipVideoController != null) {
+          unawaited(pipVideoController.preparePictureInPictureForNewMedia());
+        }
       }
       _processing = true;
       this.isLive = isLive;
@@ -1213,7 +1238,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 自动播放
     if (_autoPlay) {
       playIfExists();
+    } else if (_resumeIOSPipAfterSourceChange) {
+      // 画中画里连播下一集：上层未必要求自动播放，但小窗不能停在暂停态，
+      // 否则用户得先在系统小窗上点一下播放键才能继续。
+      playIfExists();
     }
+    _resumeIOSPipAfterSourceChange = false;
   }
 
   List<StreamSubscription>? _subscriptions;
