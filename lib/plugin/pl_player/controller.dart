@@ -620,9 +620,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _iosPipStartedEvent = false;
     isIOSPip.value = true;
     if (isLiveContainerMultitask) {
-      // 宿主的窗口托管方式可能影响小窗能否拿到画面。先把话说清楚，再在 6 秒后
-      // 把原生侧的读数摆出来——否则用户只会看到一个黑窗，无从判断卡在哪一步。
-      SmartDialog.showToast('多任务模式：若小窗无画面，稍后会显示诊断信息');
+      // 宿主的窗口托管方式可能影响小窗能否拿到画面。先把话说清楚，再把原生侧的读数
+      // 直接画进小窗画面——否则用户只会看到一个黑窗，无从判断卡在哪一步。
+      SmartDialog.showToast('多任务模式：若小窗无画面，读数会直接显示在小窗里');
+      unawaited(
+        videoController
+            .setPictureInPictureDebugOverlay(true)
+            .catchError((_) {}),
+      );
     }
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
@@ -684,11 +689,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final throttled = read('throttled');
     final copyNil = read('copyNil');
     final ticks = read('timerTicks');
+    final resumeFlush = read('resumeFlush');
     final sinceShow = (info['sinceShow'] as num?)?.toDouble() ?? -1;
     final layerStatus = info['layerStatus'] ?? '?';
     final layerReady = info['layerReady'] == true;
     final hostAttached = info['hostAttached'] == true;
     final appState = info['appState'] ?? '?';
+    final audioActive = info['audioActive'] == true;
     final hostOrigin = info['hostOrigin'] ?? '?';
     final windowBounds = info['windowBounds'] ?? '?';
 
@@ -709,11 +716,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         '结论：$verdict\n\n'
         '画面帧　出帧 $attempt / 入队 $enqueued / 取帧失败 $copyNil\n'
         '图层　　$layerStatus，可收帧 $layerReady，拒收 $notReady 次\n'
+        '恢复冲洗 $resumeFlush 次（后台态下若不为 0，说明图层原本处于需清理才能恢复解码的状态）\n'
         '补帧通道　触发 $ticks 次'
         '（小窗已显示 ${sinceShow < 0 ? '?' : sinceShow.toStringAsFixed(1)} 秒）\n'
         '降频丢弃 $throttled 次\n'
         '画面源　已挂入层级 $hostAttached，落点 $hostOrigin，窗口 $windowBounds\n'
-        'App 状态　$appState';
+        'App 状态　$appState　·　音频会话活跃 $audioActive';
 
     await SmartDialog.show(
       animationType: SmartAnimationType.centerFade_otherSlide,
