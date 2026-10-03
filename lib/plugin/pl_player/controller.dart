@@ -5,6 +5,8 @@ import 'dart:math' show max, min;
 import 'dart:ui' as ui;
 
 import 'package:PiliPlus/common/assets.dart';
+import 'package:PiliPlus/grpc/bilibili/community/service/dm/v1.pb.dart'
+    show DanmakuElem;
 import 'package:PiliPlus/http/browser_ua.dart';
 import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/http/loading_state.dart';
@@ -196,7 +198,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   RxBool get enableShowDanmakuAdaptive =>
       isLive ? enableShowLiveDanmaku : enableShowDanmaku;
 
-  late final bool autoPiP = Pref.autoPiP;
+  /// 「后台画中画」开关。
+  ///
+  /// iOS 上默认开启：与 cilicili 等播放器一致，播放中划回主屏幕即自动进入系统
+  /// 小窗，无需先点一次按钮。用户可在「设置 → 播放设置」里关掉。
+  late final bool autoPiP = Platform.isIOS
+      ? GStorage.setting.get(SettingBoxKey.autoPiP, defaultValue: true)
+      : Pref.autoPiP;
   bool get isPipMode =>
       (Platform.isAndroid && AndroidHelper.isPipMode) ||
       (PlatformUtils.isDesktop && isDesktopPip);
@@ -343,6 +351,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   StreamSubscription<String>? _iosPipErrorSub;
 
+  /// 弹幕开关变化时，同步开关小窗弹幕。
+  StreamSubscription<bool>? _iosPipDanmakuSub;
+
   /// 已「武装」自动画中画的 videoController，避免反复下发同一设置。
   Object? _iosAutoEnterArmedFor;
 
@@ -367,6 +378,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         case 'stop':
           isIOSPip.value = false;
           _releaseIOSPipHold();
+          // 若「后台画中画」仍开着，弹幕数据继续备着，等下一次自动进入。
+          _syncIOSPipDanmaku(autoPiP);
           break;
       }
     });
@@ -375,6 +388,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       isIOSPip.value = false;
       _releaseIOSPipHold();
       SmartDialog.showToast(message);
+    });
+    _iosPipDanmakuSub ??= enableShowDanmaku.listen((_) {
+      _syncIOSPipDanmaku(isIOSPip.value || autoPiP);
     });
   }
 
@@ -390,6 +406,75 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _iosAutoEnterArmedFor = videoController;
     _listenIOSPip();
     videoController.setAutoEnterPictureInPicture(autoPiP);
+    // 自动进入画中画时同样要有弹幕，故武装阶段就把弹幕数据接上。
+    if (autoPiP) {
+      _syncIOSPipDanmaku(true);
+    }
+  }
+
+  /// iOS 系统画中画是否应当显示弹幕。
+  ///
+  /// 系统小窗只显示原生画面图层，Flutter 画的弹幕进不去，因此原生侧会照着同一份
+  /// 弹幕数据自行排版绘制。这里决定要不要把数据喂过去。
+  bool get iosPipDanmakuEnabled =>
+      Platform.isIOS &&
+      !pipNoDanmaku &&
+      enableShowDanmaku.value &&
+      showDanmaku;
+
+  /// 开启 / 关闭原生侧的画中画弹幕，并同步 App 内的弹幕显示参数。
+  void _syncIOSPipDanmaku(bool enabled) {
+    if (!Platform.isIOS) return;
+    final videoController = this.videoController;
+    if (videoController == null) return;
+    if (!enabled || !iosPipDanmakuEnabled) {
+      unawaited(videoController.setPictureInPictureDanmakuEnabled(false));
+      return;
+    }
+    final blockTypes = DanmakuOptions.blockTypes;
+    final speed = playbackSpeed <= 0 ? 1.0 : playbackSpeed;
+    unawaited(
+      videoController.setPictureInPictureDanmakuConfig(<String, Object>{
+        'opacity': danmakuOpacity.value,
+        'fontScale': isFullScreen.value
+            ? DanmakuOptions.danmakuFontScaleFS
+            : DanmakuOptions.danmakuFontScale,
+        'lineHeight': DanmakuOptions.danmakuLineHeight,
+        'area': DanmakuOptions.danmakuShowArea,
+        'duration': DanmakuOptions.danmakuDuration / speed,
+        'staticDuration': DanmakuOptions.danmakuStaticDuration / speed,
+        'strokeWidth': DanmakuOptions.danmakuStrokeWidth,
+        'hideScroll': blockTypes.contains(2) ? 1 : 0,
+        'hideTop': blockTypes.contains(5) ? 1 : 0,
+        'hideBottom': blockTypes.contains(4) ? 1 : 0,
+      }),
+    );
+    unawaited(videoController.setPictureInPictureDanmakuEnabled(true));
+  }
+
+  /// 把当前时刻的弹幕交给原生侧，用于在系统小窗里绘制。
+  ///
+  /// 每条弹幕带的是相对视频起点的绝对时间，因此拖动进度条后位置依然正确；
+  /// 原生侧按弹幕 id 去重，重复下发不会重影。
+  void feedPipDanmaku(List<DanmakuElem> elems) {
+    final videoController = this.videoController;
+    if (videoController == null) return;
+    final items = <Map<String, Object>>[];
+    for (final e in elems) {
+      // 7 为高级弹幕（内容是 JSON）、8 为代码弹幕，原生侧不解析。
+      if (e.mode == 7 || e.mode == 8) continue;
+      final content = e.content;
+      if (content.isEmpty) continue;
+      items.add({
+        'id': '${e.id}',
+        'time': e.progress / 1000,
+        'mode': e.mode,
+        'color': e.color & 0xFFFFFF,
+        'text': content,
+      });
+    }
+    if (items.isEmpty) return;
+    unawaited(videoController.addPictureInPictureDanmaku(items));
   }
 
   /// 「回到 App」后是否需要等待视频页重新挂载。
@@ -484,6 +569,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final videoController = this.videoController;
     if (videoController == null) return;
     _listenIOSPip();
+    _syncIOSPipDanmaku(true);
     if (!_iosPipHold) {
       _iosPipHold = true;
       _playerCount += 1;
@@ -515,6 +601,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void exitIOSPip() {
     if (!Platform.isIOS) return;
     isIOSPip.value = false;
+    _syncIOSPipDanmaku(autoPiP);
     videoController?.setPictureInPicture(false);
     _releaseIOSPipHold();
   }
@@ -1037,6 +1124,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
+    if (Platform.isIOS) {
+      final pipVideoController = videoController;
+      if (pipVideoController != null) {
+        unawaited(pipVideoController.clearPictureInPictureDanmaku());
+      }
+    }
 
     var player = _videoPlayerController;
 
@@ -1811,6 +1904,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _iosPipSub = null;
     _iosPipErrorSub?.cancel();
     _iosPipErrorSub = null;
+    _iosPipDanmakuSub?.cancel();
+    _iosPipDanmakuSub = null;
     _iosAutoEnterArmedFor = null;
     if (isIOSPip.value) {
       videoController?.setPictureInPicture(false);

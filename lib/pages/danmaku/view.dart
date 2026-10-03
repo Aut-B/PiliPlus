@@ -43,6 +43,9 @@ class _PlDanmakuState extends State<PlDanmaku> {
   DanmakuController<DanmakuExtra>? _controller;
   int latestAddedPosition = -1;
 
+  /// 上一次交给系统画中画（原生弹幕渲染器）的播放位置。
+  int latestPipPosition = -1;
+
   @override
   void initState() {
     super.initState();
@@ -62,7 +65,9 @@ class _PlDanmakuState extends State<PlDanmaku> {
     }
     playerController
       ..addStatusLister(playerListener)
-      ..addPositionListener(videoPositionListen);
+      ..addPositionListener(videoPositionListen)
+      // 弹幕开关随时可能被改动，这里固定挂上，内部再按需判断。
+      ..addPositionListener(pipDanmakuListen);
   }
 
   @override
@@ -162,10 +167,40 @@ class _PlDanmakuState extends State<PlDanmaku> {
   void dispose() {
     playerController
       ..removePositionListener(videoPositionListen)
+      ..removePositionListener(pipDanmakuListen)
       ..removeStatusLister(playerListener);
     _plDanmakuController.dispose();
     _controller = null;
     super.dispose();
+  }
+
+  /// 系统画中画用。
+  ///
+  /// 小窗里只显示原生画面图层，Flutter 画的弹幕进不去，因此原生侧会照着同一份
+  /// 弹幕数据自行排版绘制。这里按播放进度把新出现的弹幕交给原生侧。
+  void pipDanmakuListen(Duration position) {
+    final playerController = this.playerController;
+    if (!playerController.iosPipDanmakuEnabled) {
+      return;
+    }
+    if (!playerController.playerStatus.isPlaying) {
+      return;
+    }
+
+    int currentPosition = position.inMilliseconds;
+    currentPosition -= currentPosition % 100;
+    if (currentPosition == latestPipPosition) {
+      return;
+    }
+    latestPipPosition = currentPosition;
+
+    final currentDanmakuList = _plDanmakuController.getCurrentDanmaku(
+      currentPosition,
+    );
+    if (currentDanmakuList == null || currentDanmakuList.isEmpty) {
+      return;
+    }
+    playerController.feedPipDanmaku(currentDanmakuList);
   }
 
   @override
