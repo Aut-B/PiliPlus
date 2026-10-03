@@ -203,6 +203,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   late bool isDesktopPip = false;
   /// iOS 是否处于系统级画中画（由原生侧事件驱动）。
   final RxBool isIOSPip = false.obs;
+
+  /// iOS 下是否应由系统画中画接管后台播放。
+  ///
+  /// 画中画需要在后台继续渲染画面，因此这两种情形下不能因为「后台播放」开关
+  /// 关闭而暂停播放器，否则划回主屏幕后小窗会没有画面：
+  /// * 画中画已开启；
+  /// * 用户开启了「后台画中画」开关（系统会在 App 进入后台时自动进入画中画）。
+  bool get isIOSPipKeepingAlive {
+    if (!Platform.isIOS) return false;
+    return isIOSPip.value || autoPiP;
+  }
+
   late Rect _lastWindowBounds;
   static Rect? _lastPipBounds;
 
@@ -329,11 +341,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   StreamSubscription<String>? _iosPipSub;
 
+  StreamSubscription<String>? _iosPipErrorSub;
+
+  /// 已「武装」自动画中画的 videoController，避免反复下发同一设置。
+  Object? _iosAutoEnterArmedFor;
+
   void _listenIOSPip() {
     _iosPipSub ??= PictureInPicture.events.listen((event) {
       switch (event) {
         case 'start':
           isIOSPip.value = true;
+          _iosPipStartedEvent = true;
+          // 自动进入（划回主屏幕）时同样要占住播放器引用，否则用户随后返回
+          // 上一页会把播放器一起销毁。
+          if (!_iosPipHold) {
+            _iosPipHold = true;
+            _playerCount += 1;
+          }
           break;
         case 'restore':
           // 用户点击画中画窗口的「回到 App」：若视频页已被离开，重新打开。
@@ -346,6 +370,26 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           break;
       }
     });
+    _iosPipErrorSub ??= PictureInPicture.errors.listen((message) {
+      // 启动失败时把原因显示出来，便于在真机上定位问题。
+      isIOSPip.value = false;
+      _releaseIOSPipHold();
+      SmartDialog.showToast(message);
+    });
+  }
+
+  /// iOS：按用户设置「后台画中画」开关，武装 / 解除自动画中画。
+  ///
+  /// 武装后由系统在用户划回主屏幕（App 进入后台）时自动弹出画中画窗口，
+  /// 无需手动点按按钮。
+  void _syncIOSAutoEnterPip() {
+    if (!Platform.isIOS) return;
+    final videoController = this.videoController;
+    if (videoController == null) return;
+    if (identical(_iosAutoEnterArmedFor, videoController)) return;
+    _iosAutoEnterArmedFor = videoController;
+    _listenIOSPip();
+    videoController.setAutoEnterPictureInPicture(autoPiP);
   }
 
   /// 「回到 App」后是否需要等待视频页重新挂载。
@@ -412,7 +456,31 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 从而实现“边看边刷”；退出时释放该引用。
   void enterIOSPip() {
     if (!Platform.isIOS) return;
-    if (isFullScreen.value) return;
+    if (isFullScreen.value) {
+      // 全屏（横屏）下点画中画：先退回竖屏，否则画中画弹出后应用仍停留在
+      // 全屏界面。等退出全屏后再触发（最多等 1.2 秒，超时不强求）。
+      triggerFullScreen(status: false);
+      _enterIOSPipAfterExitFullScreen(0);
+      return;
+    }
+    _doEnterIOSPip();
+  }
+
+  void _enterIOSPipAfterExitFullScreen(int attempt) {
+    if (!isFullScreen.value || attempt >= 8) {
+      _doEnterIOSPip();
+      return;
+    }
+    Future<void>.delayed(
+      const Duration(milliseconds: 150),
+      () => _enterIOSPipAfterExitFullScreen(attempt + 1),
+    );
+  }
+
+  /// 是否已收到原生侧的「画中画已启动」事件（用于诊断启动失败）。
+  bool _iosPipStartedEvent = false;
+
+  void _doEnterIOSPip() {
     final videoController = this.videoController;
     if (videoController == null) return;
     _listenIOSPip();
@@ -420,11 +488,26 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _iosPipHold = true;
       _playerCount += 1;
     }
+    _iosPipStartedEvent = false;
     isIOSPip.value = true;
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
         isIOSPip.value = false;
         _releaseIOSPipHold();
+      }),
+    );
+    // 诊断：若 2 秒后仍未真正进入画中画，说明系统拒绝了启动（例如画面源未被
+    // 判定为可见），把判断结果直接显示出来，便于在真机上定位。
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 2000), () async {
+        if (!isIOSPip.value || _iosPipStartedEvent) return;
+        final possible = await videoController.isPictureInPicturePossible();
+        if (!isIOSPip.value || _iosPipStartedEvent) return;
+        isIOSPip.value = false;
+        _releaseIOSPipHold();
+        SmartDialog.showToast(
+          possible ? '画中画启动被系统中断，请重试' : '画中画不可用：画面源未就绪',
+        );
       }),
     );
   }
@@ -1087,6 +1170,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
+          _syncIOSAutoEnterPip();
 
           if (_isAutoEnterPip) {
             if (_isCurrVideoPage) {
@@ -1725,6 +1809,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _disableAutoEnterPip();
     _iosPipSub?.cancel();
     _iosPipSub = null;
+    _iosPipErrorSub?.cancel();
+    _iosPipErrorSub = null;
+    _iosAutoEnterArmedFor = null;
     if (isIOSPip.value) {
       videoController?.setPictureInPicture(false);
       isIOSPip.value = false;

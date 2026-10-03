@@ -332,7 +332,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!plPlayerController.continuePlayInBackground.value) {
+    // 画中画需要在后台继续渲染画面，此时不按「后台播放」开关暂停。
+    if (!plPlayerController.continuePlayInBackground.value &&
+        !plPlayerController.isIOSPipKeepingAlive) {
       late final player = plPlayerController.videoPlayerController;
       if (const <AppLifecycleState>[.paused, .detached].contains(state)) {
         if (player != null && player.state.playing) {

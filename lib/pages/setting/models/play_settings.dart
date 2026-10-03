@@ -214,7 +214,7 @@ List<SettingsModel> get playSettings => [
       setKey: SettingBoxKey.continuePlayInBackground,
       defaultVal: false,
     ),
-  if (Platform.isAndroid) ...[
+  if (PlatformUtils.isMobile) ...[
     SwitchModel(
       title: '后台画中画',
       subtitle: '进入后台时以小窗形式（PiP）播放',
@@ -222,18 +222,19 @@ List<SettingsModel> get playSettings => [
       setKey: SettingBoxKey.autoPiP,
       defaultVal: false,
       onChanged: (val) {
-        if (val && !videoPlayerServiceHandler!.enableBackgroundPlay) {
+        if (val && videoPlayerServiceHandler?.enableBackgroundPlay != true) {
           SmartDialog.showToast('建议开启后台音频服务');
         }
       },
     ),
-    const SwitchModel(
-      title: '画中画不加载弹幕',
-      subtitle: '当弹幕开关开启时，小窗屏蔽弹幕以获得较好的体验',
-      leading: Icon(CustomIcons.dm_off),
-      setKey: SettingBoxKey.pipNoDanmaku,
-      defaultVal: false,
-    ),
+    if (Platform.isAndroid)
+      const SwitchModel(
+        title: '画中画不加载弹幕',
+        subtitle: '当弹幕开关开启时，小窗屏蔽弹幕以获得较好的体验',
+        leading: Icon(CustomIcons.dm_off),
+        setKey: SettingBoxKey.pipNoDanmaku,
+        defaultVal: false,
+      ),
   ],
   const SwitchModel(
     title: '全屏手势反向',

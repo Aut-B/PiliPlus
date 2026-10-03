@@ -1930,7 +1930,7 @@ class HeaderControlState extends State<HeaderControl>
                   ),
                 ),
                 if (Platform.isAndroid ||
-                    (Platform.isIOS && !isFullScreen) ||
+                    Platform.isIOS ||
                     (PlatformUtils.isDesktop && !isFullScreen))
                   SizedBox(
                     width: btnWidth,
