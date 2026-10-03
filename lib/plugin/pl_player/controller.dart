@@ -223,6 +223,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return isIOSPip.value || autoPiP;
   }
 
+  /// 是否运行在 LiveContainer 的多任务（虚拟窗口）模式里。
+  ///
+  /// 多任务模式下 guest App 并不在 LiveContainer 自己的进程里，而是由 `LiveProcess`
+  /// 扩展拉起一个独立子进程（LC 内部正是用 `LP_HOME_PATH` 区分这两种运行方式），
+  /// 画面再被托管进 LiveContainer 的场景。这种结构下 App 自己发起的系统画中画拿不到
+  /// 画面，只会弹出一个小黑窗；多任务模式下的画中画由 LiveContainer 自己在多任务窗口
+  /// 的标题栏菜单里提供。
+  static final bool isLiveContainerMultitask =
+      Platform.isIOS &&
+      (Platform.environment['LP_HOME_PATH']?.isNotEmpty ?? false);
+
   late Rect _lastWindowBounds;
   static Rect? _lastPipBounds;
 
@@ -589,6 +600,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     _iosPipStartedEvent = false;
     isIOSPip.value = true;
+    if (isLiveContainerMultitask) {
+      // 多任务模式下这条链路已知出不了画面，先把话说清楚，免得又留下一个黑窗。
+      SmartDialog.showToast('多任务模式：请用 LiveContainer 标题栏菜单的「启用画中画」');
+    }
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
         isIOSPip.value = false;
@@ -609,6 +624,37 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         );
       }),
     );
+    if (isLiveContainerMultitask) {
+      unawaited(_reportIOSPipDiagnostics(videoController));
+    }
+  }
+
+  /// 真机排障：把画中画链路的诊断快照显示出来（仅多任务模式下调用）。
+  ///
+  /// 小窗黑屏可能断在三处：渲染回调根本没出帧、图层拒收样本、样本已送出但系统没把
+  /// 画面接进小窗——三者的处理方式完全不同，所以这里把原生侧的计数直接摆出来。
+  Future<void> _reportIOSPipDiagnostics(VideoController videoController) async {
+    await Future<void>.delayed(const Duration(seconds: 4));
+    if (!isIOSPip.value) return;
+    final info = await videoController.pictureInPictureDiagnostics();
+    if (info.isEmpty) return;
+    final attempt = (info['attempt'] as num?)?.toInt() ?? 0;
+    final enqueued = (info['enqueued'] as num?)?.toInt() ?? 0;
+    final notReady = (info['notReady'] as num?)?.toInt() ?? 0;
+    final throttled = (info['throttled'] as num?)?.toInt() ?? 0;
+    final layerStatus = info['layerStatus'] ?? '?';
+    final layerReady = info['layerReady'] == true;
+    final String verdict;
+    if (attempt == 0) {
+      verdict = '渲染回调未出帧';
+    } else if (enqueued == 0 && notReady > 0) {
+      verdict = '图层拒收样本 $notReady 次（就绪=$layerReady）';
+    } else if (enqueued == 0) {
+      verdict = '无可用帧（降频丢弃 $throttled 次）';
+    } else {
+      verdict = '已送出 $enqueued 帧、图层=$layerStatus、就绪=$layerReady';
+    }
+    SmartDialog.showToast('小窗诊断：$verdict');
   }
 
   void exitIOSPip() {
