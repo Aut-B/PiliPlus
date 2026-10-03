@@ -656,9 +656,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final enqueued = (info['enqueued'] as num?)?.toInt() ?? 0;
     final notReady = (info['notReady'] as num?)?.toInt() ?? 0;
     final layerStatus = info['layerStatus'] ?? '?';
+    final hostAttached = info['hostAttached'] == true;
+    final appState = info['appState'] ?? '?';
     SmartDialog.showToast(
       '画中画启动失败：画面源未就绪'
-      '（出帧 $attempt、入队 $enqueued、图层拒收 $notReady、图层 $layerStatus）',
+      '（出帧 $attempt、入队 $enqueued、图层拒收 $notReady、'
+      '图层 $layerStatus、已挂入层级 $hostAttached、App $appState）',
     );
   }
 
