@@ -54,7 +54,8 @@ import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
-import 'package:flutter/services.dart' show HapticFeedback, DeviceOrientation;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, DeviceOrientation, HapticFeedback;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
@@ -619,8 +620,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _iosPipStartedEvent = false;
     isIOSPip.value = true;
     if (isLiveContainerMultitask) {
-      // 多任务模式下这条链路已知出不了画面，先把话说清楚，免得又留下一个黑窗。
-      SmartDialog.showToast('多任务模式：请用 LiveContainer 标题栏菜单的「启用画中画」');
+      // 宿主的窗口托管方式可能影响小窗能否拿到画面。先把话说清楚，再在 6 秒后
+      // 把原生侧的读数摆出来——否则用户只会看到一个黑窗，无从判断卡在哪一步。
+      SmartDialog.showToast('多任务模式：若小窗无画面，稍后会显示诊断信息');
     }
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
@@ -667,30 +669,72 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 真机排障：把画中画链路的诊断快照显示出来（仅多任务模式下调用）。
   ///
-  /// 小窗黑屏可能断在三处：渲染回调根本没出帧、图层拒收样本、样本已送出但系统没把
-  /// 画面接进小窗——三者的处理方式完全不同，所以这里把原生侧的计数直接摆出来。
+  /// 小窗黑屏可能断在好几处：喂帧通道根本没出帧、出帧但取不到画面、图层拒收样本、
+  /// 样本已送出但系统没把画面接进小窗——四者的处理方式完全不同。这里把原生侧的
+  /// 计数一次摆出来，并给出一句结论，便于直接对着读数定位。
   Future<void> _reportIOSPipDiagnostics(VideoController videoController) async {
-    await Future<void>.delayed(const Duration(seconds: 4));
+    await Future<void>.delayed(const Duration(seconds: 6));
     if (!isIOSPip.value) return;
     final info = await videoController.pictureInPictureDiagnostics();
     if (info.isEmpty) return;
-    final attempt = (info['attempt'] as num?)?.toInt() ?? 0;
-    final enqueued = (info['enqueued'] as num?)?.toInt() ?? 0;
-    final notReady = (info['notReady'] as num?)?.toInt() ?? 0;
-    final throttled = (info['throttled'] as num?)?.toInt() ?? 0;
+    int read(String key) => (info[key] as num?)?.toInt() ?? 0;
+    final attempt = read('attempt');
+    final enqueued = read('enqueued');
+    final notReady = read('notReady');
+    final throttled = read('throttled');
+    final copyNil = read('copyNil');
+    final ticks = read('timerTicks');
+    final sinceShow = (info['sinceShow'] as num?)?.toDouble() ?? -1;
     final layerStatus = info['layerStatus'] ?? '?';
     final layerReady = info['layerReady'] == true;
+    final hostAttached = info['hostAttached'] == true;
+    final appState = info['appState'] ?? '?';
+    final hostOrigin = info['hostOrigin'] ?? '?';
+    final windowBounds = info['windowBounds'] ?? '?';
+
     final String verdict;
-    if (attempt == 0) {
-      verdict = '渲染回调未出帧';
+    if (enqueued == 0 && attempt == 0 && ticks > 0) {
+      verdict = '补帧通道在跑，却始终取不到画面';
+    } else if (enqueued == 0 && copyNil > 0) {
+      verdict = '渲染回调在跑，但取不到像素缓冲（$copyNil 次）';
     } else if (enqueued == 0 && notReady > 0) {
-      verdict = '图层拒收样本 $notReady 次（就绪=$layerReady）';
+      verdict = '图层一直拒收样本（$notReady 次）';
     } else if (enqueued == 0) {
-      verdict = '无可用帧（降频丢弃 $throttled 次）';
+      verdict = '没有任何画面帧可送';
     } else {
-      verdict = '已送出 $enqueued 帧、图层=$layerStatus、就绪=$layerReady';
+      verdict = '画面帧已送达图层 $enqueued 次，小窗仍无画面 → 系统采样环节';
     }
-    SmartDialog.showToast('小窗诊断：$verdict');
+
+    final detail =
+        '结论：$verdict\n\n'
+        '画面帧　出帧 $attempt / 入队 $enqueued / 取帧失败 $copyNil\n'
+        '图层　　$layerStatus，可收帧 $layerReady，拒收 $notReady 次\n'
+        '补帧通道　触发 $ticks 次'
+        '（小窗已显示 ${sinceShow < 0 ? '?' : sinceShow.toStringAsFixed(1)} 秒）\n'
+        '降频丢弃 $throttled 次\n'
+        '画面源　已挂入层级 $hostAttached，落点 $hostOrigin，窗口 $windowBounds\n'
+        'App 状态　$appState';
+
+    await SmartDialog.show(
+      animationType: SmartAnimationType.centerFade_otherSlide,
+      builder: (context) => AlertDialog(
+        title: const Text('小窗诊断'),
+        content: SingleChildScrollView(child: Text(detail)),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: detail));
+              SmartDialog.showToast('已复制');
+            },
+            child: const Text('复制'),
+          ),
+          TextButton(
+            onPressed: () => SmartDialog.dismiss(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
   }
 
   void exitIOSPip() {
