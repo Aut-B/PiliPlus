@@ -8,6 +8,7 @@ import 'package:PiliPlus/common/widgets/flutter/pop_scope.dart';
 import 'package:PiliPlus/common/widgets/image/network_img_layer.dart';
 import 'package:PiliPlus/common/widgets/main_layout.dart';
 import 'package:PiliPlus/common/widgets/route_aware_mixin.dart';
+import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/models/common/nav_bar_config.dart';
 import 'package:PiliPlus/pages/home/view.dart';
 import 'package:PiliPlus/pages/main/controller.dart';
@@ -110,10 +111,15 @@ class _MainAppState extends PopScopeState<MainApp>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      // App 带着画中画在后台待久了，被系统收走的连接在这里统一换掉
+      // （视频页消失时也要兜住，所以不只写在视频页里）
+      Request.recoverConnectionsAfterBackground();
       _mainController
         ..checkUnreadDynamic()
         ..checkDefaultSearch(true)
         ..checkUnread(_mainController.useBottomNav);
+    } else if (state == AppLifecycleState.paused) {
+      Request.markBackgrounded();
     }
   }
 

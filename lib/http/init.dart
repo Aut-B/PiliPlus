@@ -126,6 +126,17 @@ class Request {
     _backgroundedAt = DateTime.now();
   }
 
+  /// 上一次后台停留时长、最近一次回到前台的时刻、累计重建连接池次数、
+  /// 最近一次重建/最近一次连接失败的时刻。前三个只用于 [connectionDiag]。
+  static Duration? _lastBackgroundDuration;
+  static DateTime? _resumedAt;
+  static int _rebuildCount = 0;
+  static DateTime? _lastRebuildAt;
+  static DateTime? _lastConnErrorAt;
+
+  /// [dio] 上是否装了带现场自愈能力的重试拦截器（装了就不必在 [Request._send] 再兜一次）。
+  static bool _retryRecoveryInstalled = false;
+
   /// 连接失败的自愈窗口：累计次数与窗口起点、上次重建时刻。
   static int _connErrorCount = 0;
   static DateTime? _connErrorWindowStart;
@@ -143,6 +154,7 @@ class Request {
       return;
     }
     final now = DateTime.now();
+    _lastConnErrorAt = now;
     final windowStart = _connErrorWindowStart;
     if (windowStart == null ||
         now.difference(windowStart) > const Duration(seconds: 10)) {
@@ -172,18 +184,58 @@ class Request {
   /// 后台待很久，一回到视频页就满屏「连接错误，请检查网络设置」，且只能靠重启恢复。
   ///
   /// 这里复用网络切换时那套重建逻辑（同一件事，只是触发条件不同）。停留时间很短时
-  /// 不动它，避免每次切前台都白白打断在途请求。
+  /// 不动它，避免每次切前台都白白打断在途请求；关闭时不用 force，让在途请求自己跑完
+  /// （池里的空闲连接——也就是可能已经死掉的那些——会被立刻丢掉）。
   static void recoverConnectionsAfterBackground() {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
+    _resumedAt = DateTime.now();
     if (backgroundedAt == null) {
       return;
     }
-    if (DateTime.now().difference(backgroundedAt) <
-        const Duration(seconds: 60)) {
+    _lastBackgroundDuration = _resumedAt!.difference(backgroundedAt);
+    if (_lastBackgroundDuration! < const Duration(seconds: 15)) {
       return;
     }
-    _resetAdaptersForNetworkChange();
+    _resetAdaptersForNetworkChange(force: false);
+  }
+
+  /// 连接失败后想再发一次之前先问这里：现在重发值不值得？
+  ///
+  /// 返回 true 表示可以重发（顺便保证池子里没有残留的死连接）；返回 false 表示刚有请求
+  /// 彻底失败过，多半是网络本身不通，重发只是白白增加请求量。
+  static bool _recoverPoolForRetry() {
+    final now = DateTime.now();
+    final lastConnErrorAt = _lastConnErrorAt;
+    if (lastConnErrorAt != null &&
+        now.difference(lastConnErrorAt) < const Duration(seconds: 2)) {
+      return false;
+    }
+    final lastRebuildAt = _lastRebuildAt;
+    if (lastRebuildAt == null ||
+        now.difference(lastRebuildAt) >= const Duration(seconds: 5)) {
+      // 只丢掉池里的空闲连接（也就是可能已经被系统收走的那些），不动在途请求——
+      // 用 force 会把同批请求一起打断，反而再制造一批连接错误。
+      _resetAdaptersForNetworkChange(force: false);
+    }
+    return true;
+  }
+
+  /// 连接问题的现场读数，会附在错误提示后面（临时诊断用）。
+  ///
+  /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
+  /// 次数、`t` 距上次回到前台多久。三个读数合起来能区分几种可能：没进过后台、
+  /// 进了后台但没重建、重建了却照样失败。
+  static String connectionDiag() {
+    final backgroundDuration = _lastBackgroundDuration;
+    final resumedAt = _resumedAt;
+    final String bg = backgroundDuration == null
+        ? '-'
+        : '${backgroundDuration.inSeconds}s';
+    final String sinceResume = resumedAt == null
+        ? '-'
+        : '+${(DateTime.now().difference(resumedAt).inMilliseconds / 1000).toStringAsFixed(1)}s';
+    return '[bg=$bg rb=$_rebuildCount t=$sinceResume]';
   }
 
   static void _onConnectivityChanged(List<ConnectivityResult> result) {
@@ -193,7 +245,7 @@ class Request {
     _networkChangeDebounce?.cancel();
     _networkChangeDebounce = Timer(
       const Duration(milliseconds: 500),
-      _resetAdaptersForNetworkChange,
+      () => _resetAdaptersForNetworkChange(),
     );
   }
 
@@ -245,21 +297,23 @@ class Request {
   }
 
   @pragma('vm:notify-debugger-on-exception')
-  static void _resetAdaptersForNetworkChange() {
+  static void _resetAdaptersForNetworkChange({bool force = true}) {
     try {
       final (h11, connectionManager) = _createPool();
       if (connectionManager != null) {
         (dio.httpClientAdapter as Http2Adapter)
-          ..connectionManager.close(force: true)
+          ..connectionManager.close(force: force)
           ..connectionManager = connectionManager
-          ..fallbackAdapter.close(force: true)
+          ..fallbackAdapter.close(force: force)
           ..fallbackAdapter = h11;
         _http11Dio?.httpClientAdapter = h11;
       } else {
         dio
-          ..httpClientAdapter.close(force: true)
+          ..httpClientAdapter.close(force: force)
           ..httpClientAdapter = h11;
       }
+      _rebuildCount++;
+      _lastRebuildAt = DateTime.now();
     } catch (_) {}
   }
 
@@ -294,8 +348,14 @@ class Request {
 
     // 先于其他Interceptor
     if (Pref.retryCount != 0) {
+      _retryRecoveryInstalled = true;
       dio.interceptors.add(
-        RetryInterceptor(dio, Pref.retryCount, Pref.retryDelay),
+        RetryInterceptor(
+          dio,
+          Pref.retryCount,
+          Pref.retryDelay,
+          recover: _recoverPoolForRetry,
+        ),
       );
     }
 
@@ -317,6 +377,52 @@ class Request {
       };
 
     if (Platform.isIOS) _watchConnectivity();
+
+    // 错误提示后面附一段连接现场读数（临时诊断用，定位到原因后即可去掉）
+    AccountManager.connectionDiag = connectionDiag;
+  }
+
+  /// 发一个请求；连接类失败时允许「换一个干净的连接池再试一次」。
+  ///
+  /// 后台（画中画）待久了，dio 池里的连接可能已经被系统收走。这类失败重发一次就能
+  /// 恢复，没必要冒到用户眼前。真正断网时不会多试太多：[_recoverPoolForRetry]
+  /// 会拦掉成串失败；装了 [RetryInterceptor] 时这一步由它负责，这里不再兜。
+  static Future<Response> _send(
+    Future<Response> Function() send, {
+    bool toastError = false,
+  }) async {
+    try {
+      return await send();
+    } on DioException catch (e) {
+      _noteConnectionError(e);
+      if (!_retryRecoveryInstalled &&
+          e.type == DioExceptionType.connectionError &&
+          _recoverPoolForRetry()) {
+        try {
+          return await send();
+        } on DioException catch (retryError) {
+          _noteConnectionError(retryError);
+          return _failure(retryError, toastError: toastError);
+        }
+      }
+      return _failure(e, toastError: toastError);
+    }
+  }
+
+  /// 把 [DioException] 包装成调用方一直在用的那种「失败响应」。
+  static Future<Response> _failure(
+    DioException e, {
+    bool toastError = false,
+  }) async {
+    // POST 的错误提示走这里（ApiInterceptor 只对非 POST 请求弹提示）
+    if (toastError) AccountManager.toast(e);
+    return Response(
+      data: {
+        'message': await AccountManager.dioError(e),
+      }, // 将自定义 Map 数据赋值给 Response 的 data 属性
+      statusCode: e.response?.statusCode ?? -1,
+      requestOptions: e.requestOptions,
+    );
   }
 
   /*
@@ -327,25 +433,14 @@ class Request {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
-  }) async {
-    try {
-      return await dio.get<T>(
-        url,
-        queryParameters: queryParameters,
-        options: options,
-        cancelToken: cancelToken,
-      );
-    } on DioException catch (e) {
-      _noteConnectionError(e);
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        }, // 将自定义 Map 数据赋值给 Response 的 data 属性
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.get<T>(
+      url,
+      queryParameters: queryParameters,
+      options: options,
+      cancelToken: cancelToken,
+    ),
+  );
 
   /*
    * post请求
@@ -356,28 +451,16 @@ class Request {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
-  }) async {
-    // if (kDebugMode) debugPrint('post-data: $data');
-    try {
-      return await dio.post<T>(
-        url,
-        data: data,
-        queryParameters: queryParameters,
-        options: options,
-        cancelToken: cancelToken,
-      );
-    } on DioException catch (e) {
-      _noteConnectionError(e);
-      AccountManager.toast(e);
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        }, // 将自定义 Map 数据赋值给 Response 的 data 属性
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.post<T>(
+      url,
+      data: data,
+      queryParameters: queryParameters,
+      options: options,
+      cancelToken: cancelToken,
+    ),
+    toastError: true,
+  );
 
   /*
    * 下载文件
@@ -386,30 +469,9 @@ class Request {
     String urlPath,
     String savePath, {
     CancelToken? cancelToken,
-  }) async {
-    try {
-      return await dio.download(
-        urlPath,
-        savePath,
-        cancelToken: cancelToken,
-        // onReceiveProgress: (int count, int total) {
-        // 进度
-        // if (kDebugMode) debugPrint("$count $total");
-        // },
-      );
-      // if (kDebugMode) debugPrint('downloadFile success: ${response.data}');
-    } on DioException catch (e) {
-      _noteConnectionError(e);
-      // if (kDebugMode) debugPrint('downloadFile error: $e');
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        },
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.download(urlPath, savePath, cancelToken: cancelToken),
+  );
 
   static List<int> responseBytesDecoder(
     List<int> responseBytes,

@@ -24,6 +24,9 @@ class AccountManager extends Interceptor {
 
   static String blockServer = Pref.blockServer;
 
+  /// 连接现场读数的提供者，由 [Request] 注入（临时诊断用，定位到原因后即可去掉）。
+  static String Function()? connectionDiag;
+
   static String getCookies(List<Cookie> cookies) {
     // Sort cookies by path (longer path first).
     cookies.sort((a, b) {
@@ -190,9 +193,39 @@ class AccountManager extends Interceptor {
         }
         _lastToastMsg = res;
         _lastToastAt = now;
-        SmartDialog.showToast(res + url);
+        SmartDialog.showToast(res + _connDetail(err) + url);
       });
     }
+  }
+
+  /// 连接类错误附一段现场读数：底层异常原文 + 连接池/前后台的现场读数。
+  ///
+  /// 真机上拿不到日志，提示是唯一能带回现场的地方，所以先都塞在这里（临时诊断用）。
+  static String _connDetail(DioException err) {
+    switch (err.type) {
+      case .connectionError:
+      case .connectionTimeout:
+      case .sendTimeout:
+        break;
+      default:
+        return '';
+    }
+    final error = err.error;
+    final String raw = switch (error) {
+      null => '',
+      SocketException(:final osError?) => osError.message,
+      SocketException(:final message) => message,
+      _ => error.toString(),
+    };
+    final buffer = StringBuffer();
+    if (raw.isNotEmpty) {
+      buffer.write(' [${raw.subLength(70)}]');
+    }
+    final diag = connectionDiag?.call();
+    if (diag != null && diag.isNotEmpty) {
+      buffer.write(' $diag');
+    }
+    return buffer.toString();
   }
 
   /// [toast] 的节流状态：上一条错误文案与弹出时刻。
