@@ -776,6 +776,21 @@ class VideoDetailController extends GetxController
 
   bool isQuerying = false;
 
+  /// 上一次取流是不是失败了（成功取到就复位）。用于回到前台时判断要不要静默重取。
+  bool _playUrlFailed = false;
+
+  /// 回到前台时，如果上一次取流失败过就静默重取一次。
+  ///
+  /// 画中画会把 App 连着在后台留好几分钟，而这段时间里设备的域名解析可能整段不可用
+  /// （连播正好在此时换集，取流就失败了，播放随之停住，且不会自行恢复——真机上用户只能
+  /// 退出重进）。回到前台说明人还在，再取一次比让他自己去找重试入口要好。只在前一次
+  /// 确实失败时才动，所以不会干扰正常播放。
+  void retryPlayUrlIfFailed() {
+    if (!_playUrlFailed || isFileSource || isQuerying) return;
+    _playUrlFailed = false;
+    queryVideoUrl();
+  }
+
   final languages = Rxn<List<LanguageItem>>();
   final currLang = Rxn<String>();
   void setLanguage(String language) {
@@ -835,6 +850,7 @@ class VideoDetailController extends GetxController
 
   @pragma('vm:prefer-inline')
   Future<void> _queryVideoUrl(bool fromReset, bool autoFullScreenFlag) async {
+    _playUrlFailed = false;
     if (plPlayerController.enableSponsorBlock && isBlock && !fromReset) {
       querySponsorBlock(bvid: bvid, cid: cid.value);
     }
@@ -981,6 +997,7 @@ class VideoDetailController extends GetxController
       }
       await _initPlayerIfNeeded(autoFullScreenFlag);
     } else {
+      _playUrlFailed = true;
       _autoPlay.value = false;
       videoState.value = false;
       if (plPlayerController.isFullScreen.value) {

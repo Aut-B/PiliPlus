@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/http/api.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/http/net_error.dart';
 import 'package:PiliPlus/models/common/account_type.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/accounts/account.dart';
@@ -175,27 +176,49 @@ class AccountManager extends Interceptor {
       'biliimg.com',
       'site/getCoin',
     ];
-    String url = err.requestOptions.uri.toString();
+    final url = err.requestOptions.uri.toString();
     if (kDebugMode) debugPrint('🌹🌹ApiInterceptor: $url\n$err');
     if (skipShow.any(url.contains) ||
         (url.contains('skipSegments') && err.requestOptions.method == 'GET')) {
-      // skip
-    } else {
-      dioError(err).then((res) {
-        // 同一条错误如果被高频重复触发（例如某个接口陷入重试循环），逐个弹出的结果是
-        // 覆盖层堆满、把主线程一起拖住，用户也只会看到刷屏。这里按消息做 3 秒节流。
-        final now = DateTime.now();
-        final lastAt = _lastToastAt;
-        if (res == _lastToastMsg &&
-            lastAt != null &&
-            now.difference(lastAt) < const Duration(seconds: 3)) {
-          return;
-        }
-        _lastToastMsg = res;
-        _lastToastAt = now;
-        SmartDialog.showToast(res + _connDetail(err) + url);
-      });
+      return;
     }
+    // 域名解析失败单独给一条说明。
+    //
+    // 它不是「网络设置」出了问题，用户也没有任何可做的动作：设备上常驻代理/VPN 时，
+    // 隧道重建期间全部查询会一起失败，几十秒后自行恢复——请求那一层已经在自动重试了
+    // （见 [RetryInterceptor] 的慢速阶梯）。这里把网址省掉、把话说清楚，顺带把节流放到
+    // 8 秒：原先那条提示带上五行查询串，正文全被盖住，而且失败成串时会一直重弹，
+    // 看起来就像软件坏了。
+    if (isDnsFailure(err)) {
+      final host = err.requestOptions.uri.host;
+      _show('域名解析失败（$host），正在自动重试', seconds: 8, diag: true);
+      return;
+    }
+    dioError(err).then(
+      (res) => _show('$res${_connDetail(err)}${url.subLength(60)}', seconds: 3),
+    );
+  }
+
+  /// 弹出错误提示；同一条文案在 [seconds] 秒内只弹一次。
+  ///
+  /// 同一条错误如果被高频重复触发（例如某个接口陷入重试循环），逐个弹出的结果是覆盖层
+  /// 堆满、把主线程一起拖住，用户也只会看到刷屏。
+  static void _show(
+    String msg, {
+    required int seconds,
+    bool diag = false,
+  }) {
+    final now = DateTime.now();
+    final lastAt = _lastToastAt;
+    if (msg == _lastToastMsg &&
+        lastAt != null &&
+        now.difference(lastAt) < Duration(seconds: seconds)) {
+      return;
+    }
+    _lastToastMsg = msg;
+    _lastToastAt = now;
+    final detail = diag ? ' ${connectionDiag?.call() ?? ''}' : '';
+    SmartDialog.showToast('$msg$detail');
   }
 
   /// 连接类错误附一段现场读数：底层异常原文 + 连接池/前后台的现场读数。
@@ -306,7 +329,10 @@ class AccountManager extends Interceptor {
       case .cancel:
         return '请求已被取消，请重新请求';
       case .connectionError:
-        return '连接错误，请检查网络设置';
+        // 域名没解析出来和「连不上」在界面上长得一样，但用户能做的事完全不同：
+        // 前者只能等（设备上开着代理/VPN 时隧道重建期间会整段失败，几十秒后就自己好了），
+        // 说成「请检查网络设置」只会让人白折腾，所以这里分开说。
+        return isDnsFailure(error) ? '域名解析失败，正在自动重试' : '连接错误，请检查网络设置';
       case .connectionTimeout:
         return '网络连接超时，请检查网络设置';
       case .receiveTimeout:

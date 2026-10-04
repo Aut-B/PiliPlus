@@ -143,9 +143,64 @@ class Request {
   static DateTime? _connErrorWindowStart;
   static DateTime? _lastConnRecoverAt;
 
-  /// 域名解析失败的累计次数，以及回前台后「解析恢复正常」所花的秒数（诊断用）。
+  /// 域名解析失败的累计次数（由 [RetryInterceptor] 在头一次看到时记，早于错误提示弹出，
+  /// 这样提示里带回来的 `dn` 才是那一刻的真数）、回前台后解析恢复正常所花的秒数
+  /// （`null` = 还在量、`-1` = 60 秒都没恢复），以及解析故障期的「闸门」。
   static int _dnsErrorCount = 0;
   static double? _dnsRecoverSeconds;
+  static Completer<void>? _dnsGate;
+  static bool _dnsProbing = false;
+
+  /// 记一次「域名解析失败」。
+  static void noteDnsFailure() {
+    _dnsErrorCount++;
+    if (!_dnsProbing) _startDnsProbe();
+  }
+
+  /// 现在是否处于解析故障期；是的话返回一个「解析恢复即完成」的 future。
+  ///
+  /// 卡在解析失败上的请求靠它提前放行：不必睡满阶梯，解析一活过来就再发一次。
+  static Future<void>? dnsRecoveryGate() => _dnsProbing ? _dnsGate?.future : null;
+
+  /// 起一轮解析探针：每 1 秒试一次，量出「解析恢复正常」花了多久。
+  ///
+  /// 解析失败是**成片**发生的：要么一次就成功，要么连着几十秒全失败（设备上常驻代理/VPN
+  /// 时，隧道重建期间全部查询一起失败）。补偿重试的阶梯该设多长完全取决于这段空窗有多长，
+  /// 而真机上拿不到任何日志——所以只能在这里量，再把数字附在错误提示后面带回来。60 秒还
+  /// 没恢复就记 -1（读数显示 `>60s`）。
+  static void _startDnsProbe() {
+    final host = Uri.parse(HttpString.appBaseUrl).host;
+    final startedAt = DateTime.now();
+    _dnsProbing = true;
+    _dnsRecoverSeconds = null;
+    _dnsGate ??= Completer<void>();
+    var attempts = 0;
+    Future<void> probe() async {
+      attempts++;
+      try {
+        await InternetAddress.lookup(host);
+        _dnsRecoverSeconds =
+            DateTime.now().difference(startedAt).inMilliseconds / 1000;
+        _finishDnsProbe();
+      } catch (_) {
+        if (attempts < 60) {
+          Timer(const Duration(seconds: 1), probe);
+        } else {
+          _dnsRecoverSeconds = -1;
+          _finishDnsProbe();
+        }
+      }
+    }
+
+    probe();
+  }
+
+  static void _finishDnsProbe() {
+    _dnsProbing = false;
+    final gate = _dnsGate;
+    _dnsGate = null;
+    if (gate != null && !gate.isCompleted) gate.complete();
+  }
 
   /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
   ///
@@ -160,8 +215,10 @@ class Request {
   /// 提示分毫未变）。它由 [RetryInterceptor] 的慢速阶梯负责，这里只记数。
   static void _noteConnectionError(DioException err) {
     final now = DateTime.now();
-    if (isHostLookupFailure(err.error)) {
-      _dnsErrorCount++;
+    if (isDnsFailure(err)) {
+      // 解析失败由 RetryInterceptor 在头一次看到时记过数（它跑在错误提示之前，读数才有
+      // 意义）；这里只兜住「重试次数被设成 0、压根没装拦截器」的情况。
+      if (!_retryRecoveryInstalled) noteDnsFailure();
       return;
     }
     if (err.type != DioExceptionType.connectionError) {
@@ -203,44 +260,17 @@ class Request {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
     _resumedAt = DateTime.now();
+    // 回到前台后解析可能还没活过来：量一量它到底要多久，并把闸门武装上——卡在解析失败
+    // 上的请求因此会在恢复的瞬间就再试一次，而不是老实睡满阶梯。
+    if (!_dnsProbing) _startDnsProbe();
     if (backgroundedAt == null) {
       return;
     }
     _lastBackgroundDuration = _resumedAt!.difference(backgroundedAt);
-    // 回到前台后域名解析可能还没活过来，量一下它到底要多久（诊断用）。
-    _probeDnsRecovery();
     if (_lastBackgroundDuration! < const Duration(seconds: 15)) {
       return;
     }
     _resetAdaptersForNetworkChange(force: false);
-  }
-
-  /// 回到前台时探一次域名解析，量一量「解析恢复正常」究竟要多久。
-  ///
-  /// 解析失败是**成片**发生的：要么一次就成功，要么连着十几秒全失败。补偿重试的阶梯该
-  /// 设多长完全取决于这段空窗有多长，而真机上拿不到任何日志——所以只能在这里量，再把
-  /// 数字附在错误提示后面带回来。每 600ms 试一次，20 秒还没好就记 -1。
-  static void _probeDnsRecovery() {
-    final host = Uri.parse(HttpString.appBaseUrl).host;
-    final startedAt = DateTime.now();
-    _dnsRecoverSeconds = null;
-    var attempts = 0;
-    Future<void> probe() async {
-      attempts++;
-      try {
-        await InternetAddress.lookup(host);
-        _dnsRecoverSeconds =
-            DateTime.now().difference(startedAt).inMilliseconds / 1000;
-      } catch (_) {
-        if (attempts < 33) {
-          Timer(const Duration(milliseconds: 600), probe);
-        } else {
-          _dnsRecoverSeconds = -1;
-        }
-      }
-    }
-
-    probe();
   }
 
   /// 连接失败后想再发一次之前先问这里：现在重发值不值得？
@@ -264,11 +294,11 @@ class Request {
     return true;
   }
 
-  /// 连接问题的现场读数，会附在错误提示后面（临时诊断用）。
+  /// 连接问题的现场读数，会附在错误提示后面。
   ///
   /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
   /// 次数、`dn` 累计域名解析失败次数、`dns` 回前台后解析恢复正常花了多久
-  /// （`?` 表示还没量出来、`>20s` 表示 20 秒都没好）、`t` 距上次回到前台多久。
+  /// （`?` 表示还在量、`>60s` 表示 60 秒都没好）、`t` 距上次回到前台多久。
   static String connectionDiag() {
     final backgroundDuration = _lastBackgroundDuration;
     final resumedAt = _resumedAt;
@@ -282,7 +312,7 @@ class Request {
     final String dns = recover == null
         ? '?'
         : recover < 0
-        ? '>20s'
+        ? '>60s'
         : '${recover.toStringAsFixed(1)}s';
     return '[bg=$bg rb=$_rebuildCount dn=$_dnsErrorCount dns=$dns t=$sinceResume]';
   }
@@ -404,6 +434,8 @@ class Request {
           Pref.retryCount,
           Pref.retryDelay,
           recover: _recoverPoolForRetry,
+          onDnsError: noteDnsFailure,
+          dnsGate: dnsRecoveryGate,
         ),
       );
     }

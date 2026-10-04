@@ -201,6 +201,9 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       // 而 dio 的连接池仍认为它们可用——回到视频页时就会满屏「连接错误」，且只能靠
       // 重启恢复。这里在回到前台时重建一次连接池（后台停留很短时不动）。
       Request.recoverConnectionsAfterBackground();
+      // 后台那段时间里域名解析也可能整段不可用，连播正好在此时换集的话取流就失败了。
+      // 回到前台静默重取一次（只在前一次确实失败时才动）。
+      videoDetailController.retryPlayUrlIfFailed();
       if (!ctr.showDanmaku) {
         introController.startTimer();
         ctr.showDanmaku = true;
