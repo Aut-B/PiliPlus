@@ -34,11 +34,19 @@ NetErrorKind classifyNetError(DioException err) {
 /// 比 [isHostLookupFailure] 多认一层：除了看底层异常，也认 dio 自己那条 message。
 /// 不同适配器（http1 / http2）包装异常的方式不完全一样，两边都认一遍更稳；认错了也
 /// 没有副作用——解析失败这条路只做「隔久一点再试」，不做任何破坏性动作。
-bool isDnsFailure(DioException err) =>
-    isHostLookupFailure(err.error) ||
-    err.message.contains('Failed host lookup') ||
-    err.message.contains('nodename nor servname') ||
-    err.message.contains('Name or service not known');
+bool isDnsFailure(DioException err) {
+  if (isHostLookupFailure(err.error)) {
+    return true;
+  }
+  // dio 那条 message 是可空的（声明为 `String?`），所以先取出来判空再比。
+  final message = err.message;
+  if (message == null) {
+    return false;
+  }
+  return message.contains('Failed host lookup') ||
+      message.contains('nodename nor servname') ||
+      message.contains('Name or service not known');
+}
 
 /// 判断一个底层异常是不是「域名解析失败」。
 ///
