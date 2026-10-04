@@ -249,7 +249,6 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     }
   }
 
-  @override
   /// 拉流卡死看门狗。
   ///
   /// 取流（接口）成功、播放器也建好了，但 mpv 一个字节都拉不到时，界面会永远停在
@@ -286,6 +285,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     });
   }
 
+  @override
   void initState() {
     super.initState();
     addObserverMobile(this);
