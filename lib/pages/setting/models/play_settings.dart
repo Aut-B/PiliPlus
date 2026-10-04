@@ -229,13 +229,7 @@ List<SettingsModel> get playSettings => [
         }
       },
     ),
-    const SwitchModel(
-      title: '画中画不加载弹幕',
-      subtitle: '开启后小窗内不显示弹幕',
-      leading: Icon(CustomIcons.dm_off),
-      setKey: SettingBoxKey.pipNoDanmaku,
-      defaultVal: false,
-    ),
+    // 小窗内的弹幕已整体移除，故不再提供「画中画不加载弹幕」开关。
   ],
   const SwitchModel(
     title: '全屏手势反向',

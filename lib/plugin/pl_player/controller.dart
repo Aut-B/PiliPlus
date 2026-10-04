@@ -446,13 +446,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// iOS 系统画中画是否应当显示弹幕。
   ///
-  /// 系统小窗只显示原生画面图层，Flutter 画的弹幕进不去，因此原生侧会照着同一份
-  /// 弹幕数据自行排版绘制。这里决定要不要把数据喂过去。
-  bool get iosPipDanmakuEnabled =>
-      Platform.isIOS &&
-      !pipNoDanmaku &&
-      enableShowDanmaku.value &&
-      showDanmaku;
+  /// 系统小窗内的弹幕已整体移除，这里恒为 `false`。
+  ///
+  /// 小窗只显示原生画面图层，Flutter 画的弹幕进不去，必须在原生侧逐帧合成：每帧一次
+  /// 整帧拷贝、建一个绘图上下文、再对当前可见的每条弹幕逐条绘制文字，源帧还取自
+  /// OpenGL 纹理缓存。播放中这条路径每帧都在跑，长时间播放会把进程拖垮——实测单个
+  /// 视频约七分钟后小窗卡死、随后新建网络连接全部失败、必须杀进程重启。因此不再向
+  /// 原生侧喂弹幕，小窗只显示画面本身。
+  bool get iosPipDanmakuEnabled => false;
 
   /// 开启 / 关闭原生侧的画中画弹幕，并同步 App 内的弹幕显示参数。
   void _syncIOSPipDanmaku(bool enabled) {
