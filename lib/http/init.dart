@@ -126,6 +126,44 @@ class Request {
     _backgroundedAt = DateTime.now();
   }
 
+  /// 连接失败的自愈窗口：累计次数与窗口起点、上次重建时刻。
+  static int _connErrorCount = 0;
+  static DateTime? _connErrorWindowStart;
+  static DateTime? _lastConnRecoverAt;
+
+  /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
+  ///
+  /// 画中画会让 App 带着活跃播放在后台停留很久，iOS 可能已经把这些 socket 收走，
+  /// 而连接池仍当作可用——于是错误成串出现（视频详情、评论、弹幕一起失败），
+  /// 并且不会自行恢复。原先唯一的出路是杀掉进程重开，这里把它降级为自动重建：
+  /// 10 秒内累计 8 次连接失败就重建一次，30 秒内最多重建一次（重建会中断在途请求，
+  /// 所以要限频）。
+  static void _noteConnectionError(DioException err) {
+    if (err.type != DioExceptionType.connectionError) {
+      return;
+    }
+    final now = DateTime.now();
+    final windowStart = _connErrorWindowStart;
+    if (windowStart == null ||
+        now.difference(windowStart) > const Duration(seconds: 10)) {
+      _connErrorWindowStart = now;
+      _connErrorCount = 0;
+    }
+    _connErrorCount++;
+    if (_connErrorCount < 8) {
+      return;
+    }
+    final lastRecoverAt = _lastConnRecoverAt;
+    if (lastRecoverAt != null &&
+        now.difference(lastRecoverAt) < const Duration(seconds: 30)) {
+      return;
+    }
+    _lastConnRecoverAt = now;
+    _connErrorCount = 0;
+    _connErrorWindowStart = now;
+    _resetAdaptersForNetworkChange();
+  }
+
   /// 回到前台时重建连接池。
   ///
   /// iOS 上 App 长时间处于后台后，系统可能已经把它的 socket 收走，而 dio 的连接池仍
@@ -298,6 +336,7 @@ class Request {
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
+      _noteConnectionError(e);
       return Response(
         data: {
           'message': await AccountManager.dioError(e),
@@ -328,6 +367,7 @@ class Request {
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
+      _noteConnectionError(e);
       AccountManager.toast(e);
       return Response(
         data: {
@@ -359,6 +399,7 @@ class Request {
       );
       // if (kDebugMode) debugPrint('downloadFile success: ${response.data}');
     } on DioException catch (e) {
+      _noteConnectionError(e);
       // if (kDebugMode) debugPrint('downloadFile error: $e');
       return Response(
         data: {

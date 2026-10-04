@@ -10,6 +10,7 @@ import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/danmaku_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:path/path.dart' as path;
 
 class PlDanmakuController {
@@ -54,6 +55,14 @@ class PlDanmakuController {
 
   Future<void> queryDanmaku(int segmentIndex) async {
     if (_isFileSource) {
+      return;
+    }
+    // App 不在前台时不取新分片：画中画期间画面由系统小窗显示，Flutter 侧的弹幕
+    // 本来就没人看得到，而在后台发起请求正是连接最容易被系统收走的时候——一旦
+    // 失败就会退化成重试风暴。回到前台后按当前进度重新取即可。
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    if (lifecycleState != null &&
+        lifecycleState != AppLifecycleState.resumed) {
       return;
     }
     if (_requestedSeg.contains(segmentIndex)) {
