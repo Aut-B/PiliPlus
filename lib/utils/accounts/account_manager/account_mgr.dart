@@ -213,7 +213,9 @@ class AccountManager extends Interceptor {
     final error = err.error;
     final String raw = switch (error) {
       null => '',
-      SocketException(:final osError?) => osError.message,
+      // 两个都带上：一个是 Dart 侧的说法，一个是系统 errno 的说法
+      SocketException(:final message, :final osError?) =>
+        '$message (${osError.message})',
       SocketException(:final message) => message,
       _ => error.toString(),
     };
