@@ -250,9 +250,46 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
   }
 
   @override
+  /// 拉流卡死看门狗。
+  ///
+  /// 取流（接口）成功、播放器也建好了，但 mpv 一个字节都拉不到时，界面会永远停在
+  /// 「加载中」：PiliPlus 自带的重试只调 refreshPlayer()，那是**拿同一个旧地址重开**，
+  /// 地址本身有问题时怎么重开都没用。唯一出路是**重新取流**——重新调接口拿一份新地址，
+  /// 顺带可能换到另一个 CDN 节点，这才是能自愈的那一步。
+  ///
+  /// 只在「缓冲中 + 已缓冲 0 秒 + 正在播放」连续 20 秒时才动手，正常的起播缓冲不会
+  /// 误触发；连续自动重取上限 3 次，避免地址彻底不通时无限打接口（计数在换源时归零）。
+  Timer? _stallTimer;
+  int _stallSeconds = 0;
+
+  void _startStallWatch() {
+    _stallTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted) return;
+      final ctr = plPlayerController;
+      final stalled =
+          !ctr.isFileSource &&
+          ctr.isBuffering.value &&
+          ctr.buffered.value == 0 &&
+          ctr.playerStatus.isPlaying;
+      if (!stalled) {
+        _stallSeconds = 0;
+        return;
+      }
+      _stallSeconds += 5;
+      if (_stallSeconds < 20) return;
+      _stallSeconds = 0;
+      if (ctr.mediaStallRetry.value >= 3) return;
+      final detailController = widget.videoDetailController;
+      if (detailController == null) return;
+      ctr.mediaStallRetry.value += 1;
+      detailController.queryVideoUrl();
+    });
+  }
+
   void initState() {
     super.initState();
     addObserverMobile(this);
+    _startStallWatch();
 
     _controlsListener = plPlayerController.showControls.listen(
       _onControlChanged,
@@ -376,6 +413,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
   @override
   void dispose() {
     removeObserverMobile(this);
+    _stallTimer?.cancel();
     _danmakuListener?.cancel();
     _tapGestureRecognizer.dispose();
     _longPressRecognizer?.dispose();
@@ -1909,10 +1947,14 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                       if (plPlayerController.isBuffering.value)
                         Obx(() {
                           final buffered = plPlayerController.buffered.value;
+                          final stallRetry =
+                              plPlayerController.mediaStallRetry.value;
                           if (buffered == 0) {
-                            return const Text(
-                              '加载中...',
-                              style: TextStyle(
+                            return Text(
+                              stallRetry > 0
+                                  ? '加载中...（已重新取流 $stallRetry 次）'
+                                  : '加载中...',
+                              style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 12,
                               ),
@@ -1926,6 +1968,30 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                             ),
                           );
                         }),
+                      // 拉流失败时的现场读数：mpv 报的原话（带播放地址的域名）。
+                      // 「接口拿不到地址」与「拿到地址却拉不到流」在界面上长得一样，
+                      // 这条原文是唯一能当场分辨的判据，所以放在这里，一定看得见。
+                      Obx(() {
+                        final err = plPlayerController.mediaError.value;
+                        if (err.isEmpty ||
+                            plPlayerController.buffered.value != 0) {
+                          return const SizedBox.shrink();
+                        }
+                        final host = plPlayerController.mediaSourceHost;
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            host.isEmpty ? err : '$host\n$err',
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 9,
+                            ),
+                          ),
+                        );
+                      }),
                     ],
                   ),
                 ),

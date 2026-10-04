@@ -213,6 +213,29 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// iOS 是否处于系统级画中画（由原生侧事件驱动）。
   final RxBool isIOSPip = false.obs;
 
+  /// 最近一条 mpv 播放错误原文（截断到 200 字符）。
+  ///
+  /// 「接口拿不到播放地址」和「拿到了地址却拉不到流」在界面上长得一模一样——
+  /// 都是播放器转圈，但一个是网络出口的问题、一个是播放地址本身的问题，处置完全不同。
+  /// 这条原文是唯一能当场分开两者的读数，所以显示在「加载中」下面，让它一定被看到。
+  final RxString mediaError = ''.obs;
+
+  /// 因为「拉流卡死」而自动重新取流的次数（换源时归零）。
+  final RxInt mediaStallRetry = RxInt(0);
+
+  /// 当前播放源的域名。
+  ///
+  /// mpv 报 `tcp: ffurl_read returned ...` 这类错误时原文里不带地址，光看那句
+  /// 分不出卡在哪个域名上；播放地址的域名（CDN 节点）是最需要确认的一项，
+  /// 所以单独取出来一并展示。
+  String get mediaSourceHost {
+    try {
+      return Uri.parse(dataSource.videoSource).host;
+    } catch (_) {
+      return '';
+    }
+  }
+
   /// 当前机型 / 系统是否支持系统级画中画（iOS）。
   ///
   /// 由原生侧的 `AVPictureInPictureController.isPictureInPictureSupported()` 判定，
@@ -1111,6 +1134,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 小窗丢掉——在小窗里一路往下看正是这个功能的主要用法。这里只通知原生侧
       // 清掉上一集的残留（图层内容、时间轴、弹幕），小窗会在新视频第一帧到来后
       // 无缝接上，而不是停在黑屏。
+      // 换源即重置拉流诊断：controller 是单例，不重置会把上一个视频的
+      // 错误原文和重取计数带过来，看门狗的上限也会被提前用掉。
+      mediaError.value = '';
+      mediaStallRetry.value = 0;
       if (Platform.isIOS) {
         if (isIOSPip.value) {
           _resumeIOSPipAfterSourceChange = true;
@@ -1510,6 +1537,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           }
         })),
       stream.error.listen((String event) {
+        // 先记下来源原文，再走下面那些分支（它们会把事件消化掉，
+        // 只有在这一层还留着全貌，供「加载中」处展示）。
+        mediaError.value = event.length > 200
+            ? '${event.substring(0, 200)}…'
+            : event;
         if (dataSource is FileSource &&
             event.startsWith("Failed to open file")) {
           return;
