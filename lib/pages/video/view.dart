@@ -58,6 +58,7 @@ import 'package:PiliPlus/plugin/pl_player/view/view.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
     show shutdownTimerService;
+import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/extension/scroll_controller_ext.dart';
@@ -196,11 +197,16 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     final isResume = state == .resumed;
     final ctr = videoDetailController.plPlayerController..visible = isResume;
     if (isResume) {
+      // 画中画会让 App 带着活跃播放在后台停留很久。iOS 可能已经把这些 socket 收走，
+      // 而 dio 的连接池仍认为它们可用——回到视频页时就会满屏「连接错误」，且只能靠
+      // 重启恢复。这里在回到前台时重建一次连接池（后台停留很短时不动）。
+      Request.recoverConnectionsAfterBackground();
       if (!ctr.showDanmaku) {
         introController.startTimer();
         ctr.showDanmaku = true;
       }
     } else if (state == .paused) {
+      Request.markBackgrounded();
       introController.cancelTimer();
       ctr.showDanmaku = false;
     }

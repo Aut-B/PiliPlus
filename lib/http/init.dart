@@ -118,6 +118,36 @@ class Request {
 
   static Timer? _networkChangeDebounce;
 
+  /// 进入后台的时刻（仅用于 [recoverConnectionsAfterBackground]）。
+  static DateTime? _backgroundedAt;
+
+  /// 记录 App 进入后台。
+  static void markBackgrounded() {
+    _backgroundedAt = DateTime.now();
+  }
+
+  /// 回到前台时重建连接池。
+  ///
+  /// iOS 上 App 长时间处于后台后，系统可能已经把它的 socket 收走，而 dio 的连接池仍
+  /// 当作那些连接可用：新请求会被塞进这些死连接（报 `DioException.connectionError`），
+  /// 池里占满的槽位又会挡住新连接的建立。画中画正好是这个场景——App 带着活跃播放在
+  /// 后台待很久，一回到视频页就满屏「连接错误，请检查网络设置」，且只能靠重启恢复。
+  ///
+  /// 这里复用网络切换时那套重建逻辑（同一件事，只是触发条件不同）。停留时间很短时
+  /// 不动它，避免每次切前台都白白打断在途请求。
+  static void recoverConnectionsAfterBackground() {
+    final backgroundedAt = _backgroundedAt;
+    _backgroundedAt = null;
+    if (backgroundedAt == null) {
+      return;
+    }
+    if (DateTime.now().difference(backgroundedAt) <
+        const Duration(seconds: 60)) {
+      return;
+    }
+    _resetAdaptersForNetworkChange();
+  }
+
   static void _onConnectivityChanged(List<ConnectivityResult> result) {
     if (listEquals(result, const [ConnectivityResult.none])) {
       return;
