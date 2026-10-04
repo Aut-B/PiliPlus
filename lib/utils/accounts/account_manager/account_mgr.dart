@@ -178,9 +178,26 @@ class AccountManager extends Interceptor {
         (url.contains('skipSegments') && err.requestOptions.method == 'GET')) {
       // skip
     } else {
-      dioError(err).then((res) => SmartDialog.showToast(res + url));
+      dioError(err).then((res) {
+        // 同一条错误如果被高频重复触发（例如某个接口陷入重试循环），逐个弹出的结果是
+        // 覆盖层堆满、把主线程一起拖住，用户也只会看到刷屏。这里按消息做 3 秒节流。
+        final now = DateTime.now();
+        final lastAt = _lastToastAt;
+        if (res == _lastToastMsg &&
+            lastAt != null &&
+            now.difference(lastAt) < const Duration(seconds: 3)) {
+          return;
+        }
+        _lastToastMsg = res;
+        _lastToastAt = now;
+        SmartDialog.showToast(res + url);
+      });
     }
   }
+
+  /// [toast] 的节流状态：上一条错误文案与弹出时刻。
+  static String? _lastToastMsg;
+  static DateTime? _lastToastAt;
 
   static Future<void> _saveCookies(Account account, Response response) async {
     final setCookies = response.headers[HttpHeaders.setCookieHeader];
