@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:PiliPlus/http/api.dart';
 import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/http/loading_state.dart';
+import 'package:PiliPlus/http/net_error.dart';
 import 'package:PiliPlus/http/retry_interceptor.dart';
 import 'package:PiliPlus/http/user.dart';
 import 'package:PiliPlus/utils/accounts.dart';
@@ -142,6 +143,10 @@ class Request {
   static DateTime? _connErrorWindowStart;
   static DateTime? _lastConnRecoverAt;
 
+  /// 域名解析失败的累计次数，以及回前台后「解析恢复正常」所花的秒数（诊断用）。
+  static int _dnsErrorCount = 0;
+  static double? _dnsRecoverSeconds;
+
   /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
   ///
   /// 画中画会让 App 带着活跃播放在后台停留很久，iOS 可能已经把这些 socket 收走，
@@ -149,11 +154,19 @@ class Request {
   /// 并且不会自行恢复。原先唯一的出路是杀掉进程重开，这里把它降级为自动重建：
   /// 10 秒内累计 8 次连接失败就重建一次，30 秒内最多重建一次（重建会中断在途请求，
   /// 所以要限频）。
+  ///
+  /// **域名解析失败不算在内**：那种错误下 socket 从未建立，池子里没有可怪罪的连接，
+  /// 重建纯属无效动作（真机据此白跑过一轮：`Failed host lookup` 照样重建了连接池，
+  /// 提示分毫未变）。它由 [RetryInterceptor] 的慢速阶梯负责，这里只记数。
   static void _noteConnectionError(DioException err) {
+    final now = DateTime.now();
+    if (isHostLookupFailure(err.error)) {
+      _dnsErrorCount++;
+      return;
+    }
     if (err.type != DioExceptionType.connectionError) {
       return;
     }
-    final now = DateTime.now();
     _lastConnErrorAt = now;
     final windowStart = _connErrorWindowStart;
     if (windowStart == null ||
@@ -194,10 +207,40 @@ class Request {
       return;
     }
     _lastBackgroundDuration = _resumedAt!.difference(backgroundedAt);
+    // 回到前台后域名解析可能还没活过来，量一下它到底要多久（诊断用）。
+    _probeDnsRecovery();
     if (_lastBackgroundDuration! < const Duration(seconds: 15)) {
       return;
     }
     _resetAdaptersForNetworkChange(force: false);
+  }
+
+  /// 回到前台时探一次域名解析，量一量「解析恢复正常」究竟要多久。
+  ///
+  /// 解析失败是**成片**发生的：要么一次就成功，要么连着十几秒全失败。补偿重试的阶梯该
+  /// 设多长完全取决于这段空窗有多长，而真机上拿不到任何日志——所以只能在这里量，再把
+  /// 数字附在错误提示后面带回来。每 600ms 试一次，20 秒还没好就记 -1。
+  static void _probeDnsRecovery() {
+    final host = Uri.parse(HttpString.appBaseUrl).host;
+    final startedAt = DateTime.now();
+    _dnsRecoverSeconds = null;
+    var attempts = 0;
+    Future<void> probe() async {
+      attempts++;
+      try {
+        await InternetAddress.lookup(host);
+        _dnsRecoverSeconds =
+            DateTime.now().difference(startedAt).inMilliseconds / 1000;
+      } catch (_) {
+        if (attempts < 33) {
+          Timer(const Duration(milliseconds: 600), probe);
+        } else {
+          _dnsRecoverSeconds = -1;
+        }
+      }
+    }
+
+    probe();
   }
 
   /// 连接失败后想再发一次之前先问这里：现在重发值不值得？
@@ -224,8 +267,8 @@ class Request {
   /// 连接问题的现场读数，会附在错误提示后面（临时诊断用）。
   ///
   /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
-  /// 次数、`t` 距上次回到前台多久。三个读数合起来能区分几种可能：没进过后台、
-  /// 进了后台但没重建、重建了却照样失败。
+  /// 次数、`dn` 累计域名解析失败次数、`dns` 回前台后解析恢复正常花了多久
+  /// （`?` 表示还没量出来、`>20s` 表示 20 秒都没好）、`t` 距上次回到前台多久。
   static String connectionDiag() {
     final backgroundDuration = _lastBackgroundDuration;
     final resumedAt = _resumedAt;
@@ -235,7 +278,13 @@ class Request {
     final String sinceResume = resumedAt == null
         ? '-'
         : '+${(DateTime.now().difference(resumedAt).inMilliseconds / 1000).toStringAsFixed(1)}s';
-    return '[bg=$bg rb=$_rebuildCount t=$sinceResume]';
+    final recover = _dnsRecoverSeconds;
+    final String dns = recover == null
+        ? '?'
+        : recover < 0
+        ? '>20s'
+        : '${recover.toStringAsFixed(1)}s';
+    return '[bg=$bg rb=$_rebuildCount dn=$_dnsErrorCount dns=$dns t=$sinceResume]';
   }
 
   static void _onConnectivityChanged(List<ConnectivityResult> result) {
@@ -395,8 +444,11 @@ class Request {
       return await send();
     } on DioException catch (e) {
       _noteConnectionError(e);
+      // 注意这里限定 connection：域名解析失败与连接池无关，换池再发一次纯属白费
+      // （真机上这么干过一整轮，提示分毫未变）。那一类由 RetryInterceptor 的慢速
+      // 阶梯负责；没装拦截器时（重试次数被设为 0）就让它如实失败。
       if (!_retryRecoveryInstalled &&
-          e.type == DioExceptionType.connectionError &&
+          classifyNetError(e) == NetErrorKind.connection &&
           _recoverPoolForRetry()) {
         try {
           return await send();
