@@ -357,7 +357,7 @@ class VideoDetailController extends GetxController
   void onInit() {
     super.onInit();
     // 解析恢复后把落空的取流补回来（见 [_onDnsRecovered]）。
-    Init.addDnsRecoveredListener(_onDnsRecovered);
+    Request.addDnsRecoveredListener(_onDnsRecovered);
     args = Get.arguments;
     videoType = args['videoType'];
     if (videoType == VideoType.pgc) {
@@ -829,7 +829,7 @@ class VideoDetailController extends GetxController
     }
     // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
     // 真机上早验证过「点播放也没用」。
-    if (player.mediaError.value.isNotEmpty && !player.isPlaying.value) {
+    if (player.mediaError.value.isNotEmpty && !player.playerStatus.isPlaying) {
       player.dnsRecoverNote.value = '解析恢复：拉流失败，重新取流一次';
       queryVideoUrl();
     }
@@ -1318,7 +1318,7 @@ class VideoDetailController extends GetxController
   @override
   void onClose() {
     _disposed = true;
-    Init.removeDnsRecoveredListener(_onDnsRecovered);
+    Request.removeDnsRecoveredListener(_onDnsRecovered);
     cid.close();
     if (isFileSource) {
       cacheLocalProgress();
