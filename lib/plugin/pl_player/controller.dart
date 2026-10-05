@@ -271,6 +271,41 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 「取流请求被排队 / 已补发」的记录（空串表示没有发生过）。
+  ///
+  /// 取流进行中再来的请求原先会被直接丢掉；「播完自动换集」那一次只有一次机会，
+  /// 落空就是黑屏且不自愈。这条记录用来留痕，只作正文行，不单独触发读数显示。
+  final RxString queryNote = RxString('');
+
+  /// 「换集之后迟迟没有接上播放」的记录（空串表示没有发生过）。
+  final RxString episodeSwitchNote = RxString('');
+
+  /// 有没有需要展示的现场读数。
+  ///
+  /// 读数原先只挂在「加载中」那个分支下面，于是「换集没接上」这种现场一个字也看
+  /// 不到——此时既不在缓冲、也没有在播放，界面上没有任何提示。改成由这个 getter
+  /// 决定：只要记过任何异常，就在播放区底部显示（见 `view.dart`）。
+  bool get hasDiagnostics =>
+      mediaError.value.isNotEmpty ||
+      urlFixNote.value.isNotEmpty ||
+      cdnSwitchNote.value.isNotEmpty ||
+      episodeSwitchNote.value.isNotEmpty;
+
+  /// 记下「有一轮取流请求被排队」。
+  void noteQueryQueued() {
+    queryNote.value = '取流请求排队中：上一轮还没结束，已让它接在后面补发';
+  }
+
+  /// 记下「排队的那一轮取流已补发」。
+  void noteQueryReissued() {
+    queryNote.value = '上一轮取流请求曾被排队，现已补发';
+  }
+
+  /// 记下「换集之后 [seconds] 秒仍未开始播放」。
+  void noteEpisodeSwitchMissed(int seconds) {
+    episodeSwitchNote.value = '换集后 $seconds 秒仍未开始播放，已重新取流';
+  }
+
   /// 当前机型 / 系统是否支持系统级画中画（iOS）。
   ///
   /// 由原生侧的 `AVPictureInPictureController.isPictureInPictureSupported()` 判定，
@@ -1182,6 +1217,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         mediaStallRetry.value = 0;
         cdnSwitchCount.value = 0;
         cdnSwitchNote.value = '';
+        episodeSwitchNote.value = '';
+        queryNote.value = '';
       }
       if (Platform.isIOS) {
         if (isIOSPip.value) {
@@ -1459,6 +1496,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     try {
       final next = NetworkSource(videoSource: video, audioSource: audio);
       dataSource = next;
+      // 换节点重开绕过了 setDataSource 的收尾，而原生侧那两件事只能在
+      // setDataSource 里做，这里必须补上，否则小窗会停在旧图层的旧时间轴上。
+      if (Platform.isIOS) {
+        if (isIOSPip.value) {
+          _resumeIOSPipAfterSourceChange = true;
+        }
+        final pipVideoController = videoController;
+        if (pipVideoController != null) {
+          unawaited(pipVideoController.preparePictureInPictureForNewMedia());
+        }
+      }
       cdnSwitchCount.value += 1;
       var host = '';
       try {

@@ -299,6 +299,26 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     });
   }
 
+  /// 现场读数的正文（每行一项，空项自动省略）。
+  ///
+  /// 依次是：播放源域名、换过的 CDN 节点、取流请求排队记录、换集未接上的记录、
+  /// 地址是否被规范化过、mpv 报的原话。这六项合起来能把「接口没拿到地址」「地址
+  /// 畸形」「这个机房连不上」「换了机房还是连不上」「换了集没接上」分开。
+  String get _diagText => [
+    if (plPlayerController.mediaSourceHost.isNotEmpty)
+      plPlayerController.mediaSourceHost,
+    if (plPlayerController.cdnSwitchNote.value.isNotEmpty)
+      plPlayerController.cdnSwitchNote.value,
+    if (plPlayerController.queryNote.value.isNotEmpty)
+      plPlayerController.queryNote.value,
+    if (plPlayerController.episodeSwitchNote.value.isNotEmpty)
+      plPlayerController.episodeSwitchNote.value,
+    if (plPlayerController.urlFixNote.value.isNotEmpty)
+      plPlayerController.urlFixNote.value,
+    if (plPlayerController.mediaError.value.isNotEmpty)
+      plPlayerController.mediaError.value,
+  ].join('\n');
+
   @override
   void initState() {
     super.initState();
@@ -1988,24 +2008,16 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                       // 连不上」在界面上长得一样，都是转圈；这几行是唯一能当场分开它们的
                       // 判据，所以放在这里，一定看得见。
                       Obx(() {
-                        final err = plPlayerController.mediaError.value;
-                        final fix = plPlayerController.urlFixNote.value;
-                        final cdn = plPlayerController.cdnSwitchNote.value;
-                        if (plPlayerController.buffered.value != 0 ||
-                            (err.isEmpty && fix.isEmpty && cdn.isEmpty)) {
+                        if (plPlayerController.buffered.value != 0) {
                           return const SizedBox.shrink();
                         }
-                        final host = plPlayerController.mediaSourceHost;
+                        final text = _diagText;
+                        if (text.isEmpty) return const SizedBox.shrink();
                         return Padding(
                           padding: const EdgeInsets.only(top: 6),
                           child: Text(
-                            [
-                              if (host.isNotEmpty) host,
-                              if (cdn.isNotEmpty) cdn,
-                              if (fix.isNotEmpty) fix,
-                              if (err.isNotEmpty) err,
-                            ].join('\n'),
-                            maxLines: 5,
+                            text,
+                            maxLines: 6,
                             overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
@@ -2082,6 +2094,36 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                   )
                 : const SizedBox.shrink();
           }),
+
+        /// 出问题时不再缩在「加载中」下面的那一份读数。
+        ///
+        /// 读数原先只挂在「加载中」那个分支里，而「播完换集没接上」这种现场既不在
+        /// 缓冲、也没有在播放，那个分支根本不渲染——于是画面上就是「黑屏 + 一个字都
+        /// 没有」，看不出是不通、被丢掉，还是压根没开始。这里再挂一处：只要记过任何
+        /// 异常，就一直显示在播放区底部（和用户会截图的那一屏同屏）；与「加载中」
+        /// 下的那份互斥，不会重复。
+        Obx(() {
+          if (!plPlayerController.hasDiagnostics) {
+            return const SizedBox.shrink();
+          }
+          final loadingShown =
+              plPlayerController.dataStatus.loading ||
+              (plPlayerController.isBuffering.value &&
+                  plPlayerController.playerStatus.isPlaying);
+          if (loadingShown) return const SizedBox.shrink();
+          return Positioned(
+            left: 8,
+            right: 8,
+            bottom: 56,
+            child: Text(
+              _diagText,
+              maxLines: 6,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70, fontSize: 9),
+            ),
+          );
+        }),
       ],
     );
     if (PlatformUtils.isDesktop) {

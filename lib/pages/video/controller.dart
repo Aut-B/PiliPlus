@@ -776,6 +776,17 @@ class VideoDetailController extends GetxController
 
   bool isQuerying = false;
 
+  /// 取流进行中被丢下的那一次请求（只留一次，当前请求一结束就补发）。
+  ///
+  /// 原先 [queryVideoUrl] 遇到 [isQuerying] 直接返回，把请求丢掉。对「切画质」
+  /// 这类可以再点的操作，丢掉无所谓；但「播完自动换集」这一次取流只有一次机会，
+  /// 引擎不会再发起，界面上也不会显示「加载中」——一旦落空，播放就永久停在上一集
+  /// 结尾（黑屏、无声、无提示，只能退出重进）。所以这里改为排队，最多留一次。
+  bool _pendingQuery = false;
+
+  /// 排队的那次请求是否带 fromReset（补发时原样带上）。
+  bool _pendingQueryFromReset = false;
+
   /// 上一次取流是不是失败了（成功取到就复位）。用于回到前台时判断要不要静默重取。
   bool _playUrlFailed = false;
 
@@ -838,6 +849,14 @@ class VideoDetailController extends GetxController
       return _initPlayerIfNeeded(autoFullScreenFlag);
     }
     if (isQuerying) {
+      // 这里原来是直接 return，把这个请求丢掉。但「播完换集」这一次取流只有一次
+      // 机会：引擎不会再自己发起，界面也不会显示「加载中」（此时既没在缓冲、也没在
+      // 播放），被丢掉之后现场就是黑屏、没声音、没提示，而且不会自愈。
+      // 改成排队：最多留一次待办，当前这一轮结束后补发；补发时读的是最新的 cid，
+      // 所以换集的那一次不会落空。
+      _pendingQuery = true;
+      _pendingQueryFromReset = _pendingQueryFromReset || fromReset;
+      plPlayerController.noteQueryQueued();
       return;
     }
     isQuerying = true;
@@ -845,6 +864,14 @@ class VideoDetailController extends GetxController
       await _queryVideoUrl(fromReset, autoFullScreenFlag);
     } finally {
       isQuerying = false;
+    }
+    if (_pendingQuery) {
+      _pendingQuery = false;
+      final pendingFromReset = _pendingQueryFromReset;
+      _pendingQueryFromReset = false;
+      plPlayerController.noteQueryReissued();
+      // 让这一轮彻底退栈后再补发，避免同帧递归。
+      scheduleMicrotask(() => queryVideoUrl(fromReset: pendingFromReset));
     }
   }
 
