@@ -50,6 +50,7 @@ import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/utils.dart';
+import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
@@ -222,6 +223,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 因为「拉流卡死」而自动重新取流的次数（换源时归零）。
   final RxInt mediaStallRetry = RxInt(0);
+
+  /// 本次取流时对播放地址做过的规范化记录（空串表示地址原样可用）。
+  ///
+  /// 上游偶尔会给出不带协议头的播放地址，加工后会变成
+  /// `https://host/host/upgcxcode/...` 这种打不开的地址——从
+  /// `VideoUtils.getCdnUrl` 的 `urlFixNote` 抄过来，和 mpv 原文一起显示，
+  /// 这样「地址被改过」和「地址没改但还是连不上」能一眼分开。
+  final RxString urlFixNote = ''.obs;
 
   /// 当前播放源的域名。
   ///
@@ -1138,6 +1147,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 错误原文和重取计数带过来，看门狗的上限也会被提前用掉。
       mediaError.value = '';
       mediaStallRetry.value = 0;
+      urlFixNote.value = VideoUtils.urlFixNote.value;
       if (Platform.isIOS) {
         if (isIOSPip.value) {
           _resumeIOSPipAfterSourceChange = true;

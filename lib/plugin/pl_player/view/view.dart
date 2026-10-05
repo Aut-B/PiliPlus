@@ -1968,21 +1968,27 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                             ),
                           );
                         }),
-                      // 拉流失败时的现场读数：mpv 报的原话（带播放地址的域名）。
-                      // 「接口拿不到地址」与「拿到地址却拉不到流」在界面上长得一样，
-                      // 这条原文是唯一能当场分辨的判据，所以放在这里，一定看得见。
+                      // 拉流失败时的现场读数：mpv 报的原话 + 地址是否被规范化过。
+                      // 「接口拿不到地址」「地址畸形」「地址正常却连不上」在界面上
+                      // 长得一样，都是转圈；这几行是唯一能当场分开三者的判据，
+                      // 所以放在这里，一定看得见。
                       Obx(() {
                         final err = plPlayerController.mediaError.value;
-                        if (err.isEmpty ||
-                            plPlayerController.buffered.value != 0) {
+                        final fix = plPlayerController.urlFixNote.value;
+                        if (plPlayerController.buffered.value != 0 ||
+                            (err.isEmpty && fix.isEmpty)) {
                           return const SizedBox.shrink();
                         }
                         final host = plPlayerController.mediaSourceHost;
                         return Padding(
                           padding: const EdgeInsets.only(top: 6),
                           child: Text(
-                            host.isEmpty ? err : '$host\n$err',
-                            maxLines: 3,
+                            [
+                              if (host.isNotEmpty) host,
+                              if (fix.isNotEmpty) fix,
+                              if (err.isNotEmpty) err,
+                            ].join('\n'),
+                            maxLines: 4,
                             overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
