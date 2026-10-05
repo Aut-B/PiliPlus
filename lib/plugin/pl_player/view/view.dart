@@ -252,18 +252,24 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
   /// 拉流卡死看门狗。
   ///
   /// 取流（接口）成功、播放器也建好了，但 mpv 一个字节都拉不到时，界面会永远停在
-  /// 「加载中」：PiliPlus 自带的重试只调 refreshPlayer()，那是**拿同一个旧地址重开**，
-  /// 地址本身有问题时怎么重开都没用。唯一出路是**重新取流**——重新调接口拿一份新地址，
-  /// 顺带可能换到另一个 CDN 节点，这才是能自愈的那一步。
+  /// 「加载中」。这时两级自愈都试过之后才轮到本看门狗：PiliPlus 自带的重试只调
+  /// `refreshPlayer()`，那是**拿同一个旧地址重开**；换 CDN 节点能换掉连不上的那一头，
+  /// 但那个机房如果是接口指定的、且形态不适合轮换，也未必救得回来。剩下的一步是
+  /// **重新取流**——重新调接口拿一份新地址与新签名。
+  ///
+  /// 顺序上先换节点再取流：换节点不花接口调用，且直接针对「这个机房连不上」。
   ///
   /// 只在「缓冲中 + 已缓冲 0 秒 + 正在播放」连续 20 秒时才动手，正常的起播缓冲不会
-  /// 误触发；连续自动重取上限 3 次，避免地址彻底不通时无限打接口（计数在换源时归零）。
+  /// 误触发；两条路各自有上限，避免地址彻底不通时无限重试（计数都只在换集时归零）。
   Timer? _stallTimer;
   int _stallSeconds = 0;
 
+  /// 看门狗正在自愈中，避免上一轮还没做完就叠下一轮。
+  bool _stallBusy = false;
+
   void _startStallWatch() {
-    _stallTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (!mounted) return;
+    _stallTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!mounted || _stallBusy) return;
       final ctr = plPlayerController;
       final stalled =
           !ctr.isFileSource &&
@@ -277,11 +283,19 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       _stallSeconds += 5;
       if (_stallSeconds < 20) return;
       _stallSeconds = 0;
-      if (ctr.mediaStallRetry.value >= 3) return;
-      final detailController = widget.videoDetailController;
-      if (detailController == null) return;
-      ctr.mediaStallRetry.value += 1;
-      detailController.queryVideoUrl();
+      _stallBusy = true;
+      try {
+        // 先换 CDN 节点：这是设备自己就能做完的一步，不花接口调用，换掉的正是
+        // 连不上的那一头。换不动了（形态不适合轮换、次数已用满）才重新取流。
+        if (await ctr.switchMirror()) return;
+        if (ctr.mediaStallRetry.value >= 3) return;
+        final detailController = widget.videoDetailController;
+        if (detailController == null) return;
+        ctr.mediaStallRetry.value += 1;
+        detailController.queryVideoUrl();
+      } finally {
+        _stallBusy = false;
+      }
     });
   }
 
@@ -1968,15 +1982,17 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                             ),
                           );
                         }),
-                      // 拉流失败时的现场读数：mpv 报的原话 + 地址是否被规范化过。
-                      // 「接口拿不到地址」「地址畸形」「地址正常却连不上」在界面上
-                      // 长得一样，都是转圈；这几行是唯一能当场分开三者的判据，
-                      // 所以放在这里，一定看得见。
+                      // 拉流失败时的现场读数：当前 CDN 节点 + 有没有换过节点 +
+                      // 地址是否被规范化过 + mpv 报的原话。
+                      // 「接口拿不到地址」「地址畸形」「这个机房连不上」「换个机房还是
+                      // 连不上」在界面上长得一样，都是转圈；这几行是唯一能当场分开它们的
+                      // 判据，所以放在这里，一定看得见。
                       Obx(() {
                         final err = plPlayerController.mediaError.value;
                         final fix = plPlayerController.urlFixNote.value;
+                        final cdn = plPlayerController.cdnSwitchNote.value;
                         if (plPlayerController.buffered.value != 0 ||
-                            (err.isEmpty && fix.isEmpty)) {
+                            (err.isEmpty && fix.isEmpty && cdn.isEmpty)) {
                           return const SizedBox.shrink();
                         }
                         final host = plPlayerController.mediaSourceHost;
@@ -1985,10 +2001,11 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                           child: Text(
                             [
                               if (host.isNotEmpty) host,
+                              if (cdn.isNotEmpty) cdn,
                               if (fix.isNotEmpty) fix,
                               if (err.isNotEmpty) err,
                             ].join('\n'),
-                            maxLines: 4,
+                            maxLines: 5,
                             overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center,
                             style: const TextStyle(

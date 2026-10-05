@@ -59,6 +59,52 @@ abstract final class VideoUtils {
     return url;
   }
 
+  /// 拉流失败时可以依次换过去的一组镜像节点。
+  ///
+  /// 全部是 `upos-sz-mirror*.bilivideo.com`：与接口下发的地址同属一套路径规则
+  /// （`/upgcxcode/...`），差别只在出口机房，所以换主机名、保留 path 与查询串即可用。
+  /// 刻意不含 `*o1` 与 `tf` 系列——前者是 `os=mcdn` 专用形态、后者走的是另一套代理
+  /// 地址，换过去必然打不开。
+  static const List<String> mirrorHosts = [
+    'upos-sz-mirrorali.bilivideo.com',
+    'upos-sz-mirroralib.bilivideo.com',
+    'upos-sz-mirrorhw.bilivideo.com',
+    'upos-sz-mirrorhwb.bilivideo.com',
+    'upos-sz-mirror08c.bilivideo.com',
+    'upos-sz-mirror08h.bilivideo.com',
+    'upos-sz-mirror08ct.bilivideo.com',
+    'upos-sz-mirrorcos.bilivideo.com',
+    'upos-sz-mirrorcosb.bilivideo.com',
+  ];
+
+  /// 把 [url] 换到轮换表里的下一个镜像节点；不适合轮换时返回 `null`。
+  ///
+  /// CDN 设置的默认值是「备用URL」，含义是**照搬接口下发的那个地址**——接口给哪个
+  /// 机房就只能连哪个机房。那个机房连不上时，不管是重新取流（接口还是给同一个机房）
+  /// 还是 `refreshPlayer()`（还是同一个地址）都只是在原地打转；换主机名是这台设备自己
+  /// 就能做的那一步：各镜像吃的是同一份内容，路径与签名参数与主机名无关。
+  static String? nextMirrorUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return null;
+    // 只对「镜像直链」轮换——`upos-sz-mirror*.bilivideo.com/upgcxcode/...` 这一种形态。
+    // 其余形态看上去也像播放地址，换了必然打不开：
+    // * `*.mcdn.bilivideo.com:448` 是 P2P 回源节点，路径挂在 `/v3/resource/` 下（里面
+    //   同样有 `/upgcxcode/` 三个字，所以只判子串会漏），还带端口；
+    // * `proxy-tf-*` 走的是 `?url=` 转代理；
+    // * `edl://` 是本地合流串。
+    // 判据收在「主机名 + 路径必须以 /upgcxcode/ 开头 + 不带端口」三条上，与上面
+    // `_mirrorRegex` 的锚点一致。
+    if (!uri.host.endsWith('.bilivideo.com')) return null;
+    if (uri.host.contains('.mcdn.')) return null;
+    if (uri.hasPort) return null;
+    if (!uri.path.startsWith('/upgcxcode/')) return null;
+    if (uri.queryParameters['os'] == 'mcdn') return null;
+    final cur = mirrorHosts.indexOf(uri.host);
+    final next = mirrorHosts[(cur == -1 ? 0 : cur + 1) % mirrorHosts.length];
+    if (next == uri.host) return null;
+    return uri.replace(host: next).toString();
+  }
+
   static final _mirrorRegex = RegExp(
     r'^https?://(?:upos-\w+-(?!302)\w+|(?:upos|proxy)-tf-[^/]+)\.(?:bilivideo|akamaized)\.(?:com|net)/upgcxcode',
   );

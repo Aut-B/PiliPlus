@@ -221,8 +221,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 这条原文是唯一能当场分开两者的读数，所以显示在「加载中」下面，让它一定被看到。
   final RxString mediaError = ''.obs;
 
-  /// 因为「拉流卡死」而自动重新取流的次数（换源时归零）。
+  /// 因为「拉流卡死」而自动重新取流的次数（换集时归零）。
   final RxInt mediaStallRetry = RxInt(0);
+
+  /// 因为「拉流失败」而换过的 CDN 节点次数（换集时归零）。
+  ///
+  /// 与 [mediaStallRetry] 是两条不同的路：重新取流只是再问一次接口，默认的
+  /// 「备用URL」会把接口给的同一个机房原样拿回来，所以那条路上限到了也还是同一个
+  /// 地址；换节点则是把主机名换掉，是这台设备自己就能做完的一步。
+  final RxInt cdnSwitchCount = RxInt(0);
+
+  /// 最近一次换 CDN 节点的记录（空串表示没换过，与 [mediaError] 一起展示）。
+  final RxString cdnSwitchNote = RxString('');
+
+  /// 换节点的次数上限；用满之后交给「重新取流」那条路。
+  static const int maxCdnSwitch = 3;
+
+  /// 换节点动作是否正在进行，防止错误回调与看门狗同时动手。
+  bool _switchingMirror = false;
+
+  /// 换节点计数挂在「哪一集」上。
+  ///
+  /// 不这样做的话，重新取流会把计数清零（它也要走 setDataSource），于是
+  /// 「换节点到上限 → 重新取流 → 计数归零 → 又开始换节点」会互相清空，两边都
+  /// 到不了上限。同一集重取不重置，换集才重置。
+  String? _mediaRetryKey;
+
+  /// 本集的响度归一化参数，换节点重开时要原样带上。
+  Volume? _volumeNorm;
 
   /// 本次取流时对播放地址做过的规范化记录（空串表示地址原样可用）。
   ///
@@ -1144,10 +1170,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 清掉上一集的残留（图层内容、时间轴、弹幕），小窗会在新视频第一帧到来后
       // 无缝接上，而不是停在黑屏。
       // 换源即重置拉流诊断：controller 是单例，不重置会把上一个视频的
-      // 错误原文和重取计数带过来，看门狗的上限也会被提前用掉。
+      // 错误原文和重取计数带过来，看门狗的上限也会被提前用掉。但计数只在**换集**
+      // 时归零——同一集重新取流必须保留计数，否则「换节点到上限 → 重新取流 →
+      // 计数归零 → 又开始换节点」会互相清空，两边都到不了上限。
       mediaError.value = '';
-      mediaStallRetry.value = 0;
       urlFixNote.value = VideoUtils.urlFixNote.value;
+      _volumeNorm = volume;
+      final retryKey = '${bvid ?? ''}|${cid ?? ''}|${aid ?? ''}|${epid ?? ''}';
+      if (_mediaRetryKey != retryKey) {
+        _mediaRetryKey = retryKey;
+        mediaStallRetry.value = 0;
+        cdnSwitchCount.value = 0;
+        cdnSwitchNote.value = '';
+      }
       if (Platform.isIOS) {
         if (isIOSPip.value) {
           _resumeIOSPipAfterSourceChange = true;
@@ -1397,6 +1432,59 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return null;
   }
 
+  /// 拉流失败时，把地址换到另一个 CDN 节点重开。
+  ///
+  /// 默认的 CDN 设置是「备用URL」，也就是照搬接口下发的那个机房；那个机房连不上时
+  /// 重新取流也好、[refreshPlayer] 也好都只是在原地重开同一个地址。换主机名是这台
+  /// 设备自己就能做完的一步：各镜像吃的是同一份内容，路径与签名参数与主机名无关。
+  ///
+  /// 返回 `false` 表示这条路也不适用（地址形态不支持轮换、次数已用满、或正在换），
+  /// 调用方应当转去别的自愈手段。
+  Future<bool> switchMirror() async {
+    if (_switchingMirror) return false;
+    if (isFileSource) return false;
+    if (_videoPlayerController == null) return false;
+    if (cdnSwitchCount.value >= maxCdnSwitch) return false;
+    final src = dataSource;
+    if (src is! NetworkSource) return false;
+
+    final video = VideoUtils.nextMirrorUrl(src.videoSource);
+    if (video == null) return false;
+    final audioSource = src.audioSource;
+    final audio = audioSource == null || audioSource.isEmpty
+        ? audioSource
+        : VideoUtils.nextMirrorUrl(audioSource);
+
+    _switchingMirror = true;
+    try {
+      final next = NetworkSource(videoSource: video, audioSource: audio);
+      dataSource = next;
+      cdnSwitchCount.value += 1;
+      var host = '';
+      try {
+        host = Uri.parse(video).host;
+      } catch (_) {}
+      cdnSwitchNote.value = '已换 CDN 节点（第 ${cdnSwitchCount.value} 次）：$host';
+      if (kDebugMode) {
+        debugPrint('switchMirror -> $host');
+      }
+      // 这条路径不经过 setDataSource 的收尾，没人替它续播。
+      final seekTo = _videoPlayerController!.state.position;
+      await _createVideoController(next, seekTo, _volumeNorm);
+      await playIfExists();
+      return true;
+    } finally {
+      _switchingMirror = false;
+    }
+  }
+
+  /// 拉流完全打不开时的自愈：先换 CDN 节点，换不动再原地重开。
+  Future<void> _recoverUnreachableMedia() async {
+    if (!await switchMirror()) {
+      await refreshPlayer();
+    }
+  }
+
   // 开始播放
   Future<void> _initializePlayer() async {
     if (_instance == null) return;
@@ -1585,7 +1673,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                     '视频链接打开失败，重试中',
                     displayTime: const Duration(milliseconds: 500),
                   );
-                  refreshPlayer();
+                  // 先换 CDN 节点：不花接口调用，而且真能换掉连不上的那一头；
+                  // 换不动（地址形态不适合轮换、次数已用满）才退回原地重开。
+                  unawaited(_recoverUnreachableMedia());
                 }
               });
             },
