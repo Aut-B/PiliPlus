@@ -818,6 +818,11 @@ class VideoDetailController extends GetxController
   ///
   /// 两种现场都收：① 取流这一次落空（`_playUrlFailed`）；② 取流其实成功了、栽在拉流上
   /// ——mpv 自己的域名解析同样走系统 DNS，解析一断照样 `Failed to open`。
+  ///
+  /// 第三种现场也一并收下：**取流的那次请求还挂在阶梯上、播放器里又什么都没装上**
+  /// （时长仍是 0），此时上面两个判据都不成立，而它同样会表现为「停着不动」。判据用
+  /// 「时长仍是 0 且没在播放」而不是「没在播放」——**用户自己按了暂停**的视频时长
+  /// 大于 0，不会被这里误伤。
   void _onDnsRecovered() {
     if (_disposed || isFileSource) return;
     final player = plPlayerController;
@@ -827,12 +832,17 @@ class VideoDetailController extends GetxController
       retryPlayUrlIfFailed();
       return;
     }
+    if (isQuerying) return;
+    final failedPull = player.mediaError.value.isNotEmpty;
+    final nothingLoaded =
+        !failedPull && player.duration.value <= 0 && !player.playerStatus.isPlaying;
+    if (!failedPull && !nothingLoaded) return;
     // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
     // 真机上早验证过「点播放也没用」。
-    if (player.mediaError.value.isNotEmpty && !player.playerStatus.isPlaying) {
-      player.dnsRecoverNote.value = '解析恢复：拉流失败，重新取流一次';
-      queryVideoUrl();
-    }
+    player.dnsRecoverNote.value = failedPull
+        ? '解析恢复：拉流失败，重新取流一次'
+        : '解析恢复：播放器里空着，重新取流一次';
+    queryVideoUrl();
   }
 
   final languages = Rxn<List<LanguageItem>>();
