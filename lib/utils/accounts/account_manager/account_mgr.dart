@@ -185,13 +185,16 @@ class AccountManager extends Interceptor {
     // 域名解析失败单独给一条说明。
     //
     // 它不是「网络设置」出了问题，用户也没有任何可做的动作：设备上常驻代理/VPN 时，
-    // 隧道重建期间全部查询会一起失败，几十秒后自行恢复——请求那一层已经在自动重试了
-    // （见 [RetryInterceptor] 的慢速阶梯）。这里把网址省掉、把话说清楚，顺带把节流放到
-    // 8 秒：原先那条提示带上五行查询串，正文全被盖住，而且失败成串时会一直重弹，
-    // 看起来就像软件坏了。
+    // 隧道重建期间全部查询会一起失败，几十秒到几分钟后自行恢复——请求那一层已经在自动
+    // 重试了（见 [RetryInterceptor] 的慢速阶梯）。这里把网址省掉、把话说清楚。
+    //
+    // 另外两点是从真机上学到的：① 这条提示本身被当成了「软件坏了」，所以措辞改成
+    // 「会自动继续」的口吻；② 一轮故障期里几十个请求会接连报同一个错，逐个弹就是刷屏，
+    // 所以改成**每个故障期只提示一次**（解析恢复后名额由探针重置，见 `Init`）。
     if (isDnsFailure(err)) {
       final host = err.requestOptions.uri.host;
-      _show('域名解析失败（$host），正在自动重试', seconds: 8, diag: true);
+      if (!takeDnsNotice()) return;
+      _show('网络解析暂时不通（$host），恢复后会自动继续', seconds: 30, diag: true);
       return;
     }
     dioError(err).then(

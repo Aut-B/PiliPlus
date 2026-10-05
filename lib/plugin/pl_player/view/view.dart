@@ -314,6 +314,8 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       plPlayerController.queryNote.value,
     if (plPlayerController.episodeSwitchNote.value.isNotEmpty)
       plPlayerController.episodeSwitchNote.value,
+    if (plPlayerController.dnsRecoverNote.value.isNotEmpty)
+      plPlayerController.dnsRecoverNote.value,
     if (plPlayerController.urlFixNote.value.isNotEmpty)
       plPlayerController.urlFixNote.value,
     if (plPlayerController.mediaProbe.value.isNotEmpty)

@@ -356,6 +356,8 @@ class VideoDetailController extends GetxController
   @override
   void onInit() {
     super.onInit();
+    // 解析恢复后把落空的取流补回来（见 [_onDnsRecovered]）。
+    Init.addDnsRecoveredListener(_onDnsRecovered);
     args = Get.arguments;
     videoType = args['videoType'];
     if (videoType == VideoType.pgc) {
@@ -800,6 +802,37 @@ class VideoDetailController extends GetxController
     if (!_playUrlFailed || isFileSource || isQuerying) return;
     _playUrlFailed = false;
     queryVideoUrl();
+  }
+
+  /// 控制器是否已关闭。
+  ///
+  /// 解析恢复的订阅列表是全局的，注销不保证及时（`onClose` 与订阅回调可能交错），
+  /// 回调落到已关闭的控制器上会去写已经 `close()` 掉的 Rx，所以留一道闸。
+  bool _disposed = false;
+
+  /// 解析恢复后的补发入口（订阅 `Init` 的恢复信号）。
+  ///
+  /// 取流落空时阶梯最多替我们等约 4 分钟；一旦阶梯走完、界面已经回到「没在播」的状态，
+  /// 就没有人再补这一次请求了——真机上这就是「卡住不动、必须退出重进」。这里让解析一
+  /// 恢复就补一次，用户不必做任何动作。
+  ///
+  /// 两种现场都收：① 取流这一次落空（`_playUrlFailed`）；② 取流其实成功了、栽在拉流上
+  /// ——mpv 自己的域名解析同样走系统 DNS，解析一断照样 `Failed to open`。
+  void _onDnsRecovered() {
+    if (_disposed || isFileSource) return;
+    final player = plPlayerController;
+    if (_playUrlFailed) {
+      if (isQuerying) return;
+      player.dnsRecoverNote.value = '解析恢复：自动补了一次取流';
+      retryPlayUrlIfFailed();
+      return;
+    }
+    // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
+    // 真机上早验证过「点播放也没用」。
+    if (player.mediaError.value.isNotEmpty && !player.isPlaying.value) {
+      player.dnsRecoverNote.value = '解析恢复：拉流失败，重新取流一次';
+      queryVideoUrl();
+    }
   }
 
   final languages = Rxn<List<LanguageItem>>();
@@ -1284,6 +1317,8 @@ class VideoDetailController extends GetxController
 
   @override
   void onClose() {
+    _disposed = true;
+    Init.removeDnsRecoveredListener(_onDnsRecovered);
     cid.close();
     if (isFileSource) {
       cacheLocalProgress();

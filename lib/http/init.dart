@@ -144,16 +144,47 @@ class Request {
   static DateTime? _lastConnRecoverAt;
 
   /// 域名解析失败的累计次数（由 [RetryInterceptor] 在头一次看到时记，早于错误提示弹出，
-  /// 这样提示里带回来的 `dn` 才是那一刻的真数）、回前台后解析恢复正常所花的秒数
-  /// （`null` = 还在量、`-1` = 60 秒都没恢复），以及解析故障期的「闸门」。
+  /// 这样提示里带回来的 `dn` 才是那一刻的真数）、采样时刻解析恢复正常所花的秒数
+  /// （`null` = 还在量、`-1` = 240 秒都没恢复），以及解析故障期的「闸门」。
   static int _dnsErrorCount = 0;
   static double? _dnsRecoverSeconds;
   static Completer<void>? _dnsGate;
   static bool _dnsProbing = false;
 
+  /// 最近一次解析失败的主机名。
+  ///
+  /// 探针原先固定探 app 域名（`HttpString.appBaseUrl`），而真机上失败的是 api 域名——
+  /// 量出来的「恢复耗时」根本不属于失败的那条路，甚至可能出现「读数说好了、请求还在失败」。
+  static String? _dnsFailHost;
+
+  /// 这一轮故障期的「解析已恢复」还没通知出去。
+  static bool _dnsRecoveredPending = false;
+
+  /// 「解析恢复」的订阅者。
+  ///
+  /// 解析成片失败时，一批请求会在阶梯上一直等；但**已经放弃**的那些（阶梯走完、界面上
+  /// 留了错误占位）没人再管它们，表现为「卡死在那儿，不自己好」。这里给一个恢复信号，
+  /// 让视频页之类把先前落空的请求补回来，不必等用户切前台或退出重进。
+  static final List<void Function()> _dnsRecoveredListeners = [];
+
+  static void addDnsRecoveredListener(void Function() listener) {
+    if (!_dnsRecoveredListeners.contains(listener)) {
+      _dnsRecoveredListeners.add(listener);
+    }
+  }
+
+  static void removeDnsRecoveredListener(void Function() listener) {
+    _dnsRecoveredListeners.remove(listener);
+  }
+
   /// 记一次「域名解析失败」。
-  static void noteDnsFailure() {
+  static void noteDnsFailure([String? host]) {
     _dnsErrorCount++;
+    if (host != null && host.isNotEmpty) {
+      _dnsFailHost = host;
+    }
+    _dnsRecoveredPending = true;
+    noteDnsNoticePending();
     if (!_dnsProbing) _startDnsProbe();
   }
 
@@ -164,12 +195,13 @@ class Request {
 
   /// 起一轮解析探针：每 1 秒试一次，量出「解析恢复正常」花了多久。
   ///
-  /// 解析失败是**成片**发生的：要么一次就成功，要么连着几十秒全失败（设备上常驻代理/VPN
-  /// 时，隧道重建期间全部查询一起失败）。补偿重试的阶梯该设多长完全取决于这段空窗有多长，
-  /// 而真机上拿不到任何日志——所以只能在这里量，再把数字附在错误提示后面带回来。60 秒还
-  /// 没恢复就记 -1（读数显示 `>60s`）。
+  /// 探的是**真正失败的那个域名**（见 [_dnsFailHost]）。解析失败是**成片**发生的：要么一次
+  /// 就成功，要么连着几十秒全失败（设备上常驻代理/VPN 时，隧道重建期间全部查询一起失败）。
+  /// 补偿重试的阶梯该设多长完全取决于这段空窗有多长，而真机上拿不到任何日志——所以只能在
+  /// 这里量，再把数字附在错误提示后面带回来。真机读数出现过「60 秒都没恢复」（`dn=17 dns=?`），
+  /// 说明空窗没有上界，所以量程放到 240 秒；到顶记 -1（读数显示 `>240s`）。
   static void _startDnsProbe() {
-    final host = Uri.parse(HttpString.appBaseUrl).host;
+    final host = _dnsFailHost ?? Uri.parse(HttpString.appBaseUrl).host;
     final startedAt = DateTime.now();
     _dnsProbing = true;
     _dnsRecoverSeconds = null;
@@ -183,7 +215,7 @@ class Request {
             DateTime.now().difference(startedAt).inMilliseconds / 1000;
         _finishDnsProbe();
       } catch (_) {
-        if (attempts < 60) {
+        if (attempts < 240) {
           Timer(const Duration(seconds: 1), probe);
         } else {
           _dnsRecoverSeconds = -1;
@@ -200,6 +232,17 @@ class Request {
     final gate = _dnsGate;
     _dnsGate = null;
     if (gate != null && !gate.isCompleted) gate.complete();
+    if (!_dnsRecoveredPending) {
+      return;
+    }
+    _dnsRecoveredPending = false;
+    // 解析活过来了：下一轮故障期可以再跟用户说一次；订阅者（视频页等）把先前落空的请求补回来。
+    clearDnsNoticePending();
+    for (final listener in List.of(_dnsRecoveredListeners)) {
+      try {
+        listener();
+      } catch (_) {}
+    }
   }
 
   /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
@@ -297,8 +340,8 @@ class Request {
   /// 连接问题的现场读数，会附在错误提示后面。
   ///
   /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
-  /// 次数、`dn` 累计域名解析失败次数、`dns` 回前台后解析恢复正常花了多久
-  /// （`?` 表示还在量、`>60s` 表示 60 秒都没好）、`t` 距上次回到前台多久。
+  /// 次数、`dn` 累计域名解析失败次数、`dns` 采样时刻解析恢复正常花了多久
+  /// （`?` 表示还在量、`>240s` 表示 240 秒都没好）、`t` 距上次回到前台多久。
   static String connectionDiag() {
     final backgroundDuration = _lastBackgroundDuration;
     final resumedAt = _resumedAt;
@@ -312,7 +355,7 @@ class Request {
     final String dns = recover == null
         ? '?'
         : recover < 0
-        ? '>60s'
+        ? '>240s'
         : '${recover.toStringAsFixed(1)}s';
     return '[bg=$bg rb=$_rebuildCount dn=$_dnsErrorCount dns=$dns t=$sinceResume]';
   }

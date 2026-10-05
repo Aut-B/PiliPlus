@@ -303,6 +303,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 「换集之后迟迟没有接上播放」的记录（空串表示没有发生过）。
   final RxString episodeSwitchNote = RxString('');
 
+  /// 「解析恢复后自动补了一次」的记录（空串表示没有发生过）。
+  ///
+  /// 真机上最常见的一种卡死是「设备的域名解析成片失败几十秒到几分钟」：取流请求要么在
+  /// 阶梯上一直等、要么已经落空，而拉流那一头（mpv 自己的解析同样走系统 DNS）也一起
+  /// 失败。解析一恢复，视频页会主动补一次取流，这里把这件事记下来——否则事后看图
+  /// 只会看到「画面自己好了」，不知道是谁救的。
+  final RxString dnsRecoverNote = RxString('');
+
   /// 有没有需要展示的现场读数。
   ///
   /// 读数原先只挂在「加载中」那个分支下面，于是「换集没接上」这种现场一个字也看
@@ -313,6 +321,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       mediaProbe.value.isNotEmpty ||
       urlFixNote.value.isNotEmpty ||
       cdnSwitchNote.value.isNotEmpty ||
+      dnsRecoverNote.value.isNotEmpty ||
       episodeSwitchNote.value.isNotEmpty;
 
   /// 收下 mpv 的一句错误原文。
@@ -389,6 +398,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ..writeln('重取次数：${mediaStallRetry.value}')
       ..writeln('取流排队：${queryNote.value}')
       ..writeln('换集看门狗：${episodeSwitchNote.value}')
+      ..writeln('解析恢复补发：${dnsRecoverNote.value}')
       ..writeln(
         '播放状态：buffering=${isBuffering.value} '
         'buffered=${buffered.value} '
@@ -1336,6 +1346,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         cdnSwitchCount.value = 0;
         cdnSwitchNote.value = '';
         episodeSwitchNote.value = '';
+        dnsRecoverNote.value = '';
         queryNote.value = '';
       }
       if (Platform.isIOS) {

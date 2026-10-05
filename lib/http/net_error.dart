@@ -15,6 +15,28 @@ import 'package:dio/dio.dart';
 ///   已经失效的 socket，重建一次是有意义的。
 enum NetErrorKind { none, dns, connection }
 
+/// 解析故障期的「面向用户提示」名额。
+///
+/// 解析失败是**成片**的：一轮故障期里几十个请求会接连报同一个错。逐个弹提示的结果是
+/// 屏幕上刷满绿条，用户还会把这条提示本身当成故障（真机截图里就是如此）。这里把提示收成
+/// 「每个故障期一次」，解析恢复后由探针重新放行（见 `Init._finishDnsProbe`）。
+bool _dnsNoticePending = false;
+
+/// 记下「这一轮解析故障期还没跟用户说过」。
+void noteDnsNoticePending() => _dnsNoticePending = true;
+
+/// 解析恢复：下一轮故障期可以再提示一次。
+void clearDnsNoticePending() => _dnsNoticePending = false;
+
+/// 取用一次提示名额（本轮故障期已提示过就返回 false）。
+bool takeDnsNotice() {
+  if (!_dnsNoticePending) {
+    return false;
+  }
+  _dnsNoticePending = false;
+  return true;
+}
+
 /// 把 [DioException] 归到上面三类之一。
 NetErrorKind classifyNetError(DioException err) {
   switch (err.type) {
