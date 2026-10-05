@@ -302,8 +302,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
   /// 现场读数的正文（每行一项，空项自动省略）。
   ///
   /// 依次是：播放源域名、换过的 CDN 节点、取流请求排队记录、换集未接上的记录、
-  /// 地址是否被规范化过、mpv 报的原话。这六项合起来能把「接口没拿到地址」「地址
-  /// 畸形」「这个机房连不上」「换了机房还是连不上」「换了集没接上」分开。
+  /// 地址是否被规范化过、失败现场的网络探测结论、mpv 报的原话。这几项合起来能把
+  /// 「接口没拿到地址」「地址畸形」「这个机房连不上」「换了机房还是连不上」
+  /// 「换了集没接上」「出口根本不通」分开。
   String get _diagText => [
     if (plPlayerController.mediaSourceHost.isNotEmpty)
       plPlayerController.mediaSourceHost,
@@ -315,9 +316,23 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       plPlayerController.episodeSwitchNote.value,
     if (plPlayerController.urlFixNote.value.isNotEmpty)
       plPlayerController.urlFixNote.value,
+    if (plPlayerController.mediaProbe.value.isNotEmpty)
+      plPlayerController.mediaProbe.value,
     if (plPlayerController.mediaError.value.isNotEmpty)
       plPlayerController.mediaError.value,
   ].join('\n');
+
+  /// 把完整诊断整段复制到剪贴板。
+  ///
+  /// 屏上那几行为了不遮住画面必须收短（长 URL 尤其占地方），而真正要看全的是完整
+  /// 那一份——整条播放地址、mpv 的原始报错、以及失败现场自动做的那次网络探测。
+  /// 所以读数本身做成可点的：点一下整段带走，直接粘贴发送即可。
+  void _copyDiagnostics() {
+    unawaited(
+      Clipboard.setData(ClipboardData(text: plPlayerController.mediaDiagFull)),
+    );
+    SmartDialog.showToast('诊断信息已复制，可直接粘贴发送');
+  }
 
   @override
   void initState() {
@@ -2015,14 +2030,18 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                         if (text.isEmpty) return const SizedBox.shrink();
                         return Padding(
                           padding: const EdgeInsets.only(top: 6),
-                          child: Text(
-                            text,
-                            maxLines: 6,
-                            overflow: TextOverflow.ellipsis,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 9,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _copyDiagnostics,
+                            child: Text(
+                              '$text\n（轻点复制完整诊断）',
+                              maxLines: 9,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 9,
+                              ),
                             ),
                           ),
                         );
@@ -2115,12 +2134,16 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             left: 8,
             right: 8,
             bottom: 56,
-            child: Text(
-              _diagText,
-              maxLines: 6,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 9),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _copyDiagnostics,
+              child: Text(
+                '$_diagText\n（轻点复制完整诊断）',
+                maxLines: 9,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 9),
+              ),
             ),
           );
         }),

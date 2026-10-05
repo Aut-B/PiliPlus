@@ -20,6 +20,7 @@ import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
+import 'package:PiliPlus/plugin/pl_player/media_diag.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
@@ -214,12 +215,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// iOS 是否处于系统级画中画（由原生侧事件驱动）。
   final RxBool isIOSPip = false.obs;
 
-  /// 最近一条 mpv 播放错误原文（截断到 200 字符）。
+  /// mpv 播放错误原文（累积最近几条，供现场判读）。
   ///
   /// 「接口拿不到播放地址」和「拿到了地址却拉不到流」在界面上长得一模一样——
   /// 都是播放器转圈，但一个是网络出口的问题、一个是播放地址本身的问题，处置完全不同。
   /// 这条原文是唯一能当场分开两者的读数，所以显示在「加载中」下面，让它一定被看到。
+  ///
+  /// 早先只留**最后一条**，而 libavformat 报的具体原因（`HTTP error 403 Forbidden`、
+  /// `Connection refused`…）是先到的、mpv 那句笼统的 `Failed to open <长 URL>` 是后到的，
+  /// 后者把前者覆盖掉了——真正有用的那句反而从来没被看到过。现在改成累积，
+  /// 展示时只把长 URL 收短，原因原样保留。
   final RxString mediaError = ''.obs;
+
+  /// 本次拉流失败现场累积下来的 mpv 原文，最新在后。
+  ///
+  /// 存的是**原文**（复制诊断时要看全），展示时才经 [shortenMpvError] 收短。
+  final List<String> _mediaErrBuf = <String>[];
+
+  /// 失败现场对播放地址做的一次主动探测结论（空串表示还没探过）。
+  ///
+  /// 见 `media_diag.dart`：它把 DNS / HTTP / 接收三层分开写出来，用来区分
+  /// 「出口不通」与「连上了却被拒绝」——这两种在 mpv 那句 `Failed to open` 里长得一样。
+  final RxString mediaProbe = ''.obs;
+
+  /// 已经探测过的地址；每次失败回调都去探一遍没有意义。
+  String _probedUrl = '';
+
+  /// 探测是否正在进行。
+  bool _probing = false;
 
   /// 因为「拉流卡死」而自动重新取流的次数（换集时归零）。
   final RxInt mediaStallRetry = RxInt(0);
@@ -287,9 +310,101 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 决定：只要记过任何异常，就在播放区底部显示（见 `view.dart`）。
   bool get hasDiagnostics =>
       mediaError.value.isNotEmpty ||
+      mediaProbe.value.isNotEmpty ||
       urlFixNote.value.isNotEmpty ||
       cdnSwitchNote.value.isNotEmpty ||
       episodeSwitchNote.value.isNotEmpty;
+
+  /// 收下 mpv 的一句错误原文。
+  ///
+  /// 累积而非覆盖：一次打开失败往往连着好几条日志，最有信息量的通常是**先到的**
+  /// libavformat 那一条（它写着到底为什么打不开），后到的 `Failed to open <URL>`
+  /// 只是把结论重复了一遍。
+  void _pushMediaError(String event) {
+    if (event.isEmpty) return;
+    if (_mediaErrBuf.isNotEmpty && _mediaErrBuf.last == event) return;
+    _mediaErrBuf.add(event);
+    if (_mediaErrBuf.length > 4) {
+      _mediaErrBuf.removeRange(0, _mediaErrBuf.length - 4);
+    }
+    mediaError.value = _mediaErrBuf.map(shortenMpvError).join('\n');
+  }
+
+  /// 展示用：把 mpv 原文里的长 URL 收成「域名/…」。
+  ///
+  /// `Failed to open https://upos-…/upgcxcode/…?e=…` 里的 URL 常常上百个字符，
+  /// 在窄屏上要占三四行，把真正的原因挤得没地方显示。域名是这里唯一有信息量的部分，
+  /// 路径与签名没有必要在屏幕上重复一遍（完整原文留给「复制诊断」）。
+  static String shortenMpvError(String event) {
+    return event.replaceAllMapped(RegExp(r'https?://\S{32,}'), (match) {
+      final raw = match.group(0)!;
+      try {
+        final host = Uri.parse(raw).host;
+        if (host.isNotEmpty) return 'https://$host/…';
+      } catch (_) {
+        // 解析不出来就退回截断，读数不值得为此中断。
+      }
+      return '${raw.substring(0, 24)}…';
+    });
+  }
+
+  /// 在失败现场对当前播放地址主动探一次（同一个地址只探一次）。
+  ///
+  /// 刻意**不阻塞**自愈流程：探测只是取证，该换节点换节点、该重取重取。
+  Future<void> runMediaProbe() async {
+    if (_probing) return;
+    final src = dataSource;
+    if (src is! NetworkSource) return;
+    final url = src.videoSource;
+    if (url.isEmpty || url == _probedUrl) return;
+    _probedUrl = url;
+    _probing = true;
+    try {
+      mediaProbe.value = '探测：进行中…';
+      mediaProbe.value = await MediaDiag.probe(url);
+    } catch (e) {
+      mediaProbe.value = '探测：${e.runtimeType}';
+    } finally {
+      _probing = false;
+    }
+  }
+
+  /// 一份可以整段复制走的诊断文本。
+  ///
+  /// 屏上那几行为了不遮住画面必须收短，真要看全（尤其 mpv 的完整原文与整条播放地址）
+  /// 需要一次性带走这么多东西，所以读数末尾放了「复制」。
+  String get mediaDiagFull {
+    final buf = StringBuffer()
+      ..writeln('=== PiliPlus 播放诊断 ===')
+      ..writeln('时间：${DateTime.now().toIso8601String()}');
+    final src = dataSource;
+    if (src is NetworkSource) {
+      buf
+        ..writeln('视频源：${src.videoSource}')
+        ..writeln('音频源：${src.audioSource ?? ''}');
+    }
+    buf
+      ..writeln('地址修复：${urlFixNote.value}')
+      ..writeln('换节点：${cdnSwitchNote.value}')
+      ..writeln('重取次数：${mediaStallRetry.value}')
+      ..writeln('取流排队：${queryNote.value}')
+      ..writeln('换集看门狗：${episodeSwitchNote.value}')
+      ..writeln(
+        '播放状态：buffering=${isBuffering.value} '
+        'buffered=${buffered.value} '
+        'playing=${playerStatus.isPlaying} '
+        'position=${_videoPlayerController?.state.position} '
+        'duration=${_videoPlayerController?.state.duration}',
+      )
+      ..writeln('— mpv 原文（最近 ${_mediaErrBuf.length} 条，最新在后）—');
+    for (final e in _mediaErrBuf) {
+      buf.writeln(e);
+    }
+    buf
+      ..writeln('— 主动探测 —')
+      ..writeln(mediaProbe.value);
+    return buf.toString();
+  }
 
   /// 记下「有一轮取流请求被排队」。
   void noteQueryQueued() {
@@ -1209,6 +1324,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 时归零——同一集重新取流必须保留计数，否则「换节点到上限 → 重新取流 →
       // 计数归零 → 又开始换节点」会互相清空，两边都到不了上限。
       mediaError.value = '';
+      _mediaErrBuf.clear();
+      mediaProbe.value = '';
+      _probedUrl = '';
       urlFixNote.value = VideoUtils.urlFixNote.value;
       _volumeNorm = volume;
       final retryKey = '${bvid ?? ''}|${cid ?? ''}|${aid ?? ''}|${epid ?? ''}';
@@ -1527,7 +1645,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   /// 拉流完全打不开时的自愈：先换 CDN 节点，换不动再原地重开。
+  ///
+  /// 与此同时对同一个地址做一次主动探测（不阻塞自愈）：换节点这条路是否有效、
+  /// 到底断在哪一层，下一次要看的正是这个结论。
   Future<void> _recoverUnreachableMedia() async {
+    unawaited(runMediaProbe());
     if (!await switchMirror()) {
       await refreshPlayer();
     }
@@ -1685,9 +1807,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       stream.error.listen((String event) {
         // 先记下来源原文，再走下面那些分支（它们会把事件消化掉，
         // 只有在这一层还留着全貌，供「加载中」处展示）。
-        mediaError.value = event.length > 200
-            ? '${event.substring(0, 200)}…'
-            : event;
+        _pushMediaError(event);
         if (dataSource is FileSource &&
             event.startsWith("Failed to open file")) {
           return;
