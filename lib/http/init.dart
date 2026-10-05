@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/http/api.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/http/dns_recovery.dart';
 import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/http/net_error.dart';
 import 'package:PiliPlus/http/retry_interceptor.dart';
@@ -143,107 +144,16 @@ class Request {
   static DateTime? _connErrorWindowStart;
   static DateTime? _lastConnRecoverAt;
 
-  /// 域名解析失败的累计次数（由 [RetryInterceptor] 在头一次看到时记，早于错误提示弹出，
-  /// 这样提示里带回来的 `dn` 才是那一刻的真数）、采样时刻解析恢复正常所花的秒数
-  /// （`null` = 还在量、`-1` = 240 秒都没恢复），以及解析故障期的「闸门」。
-  static int _dnsErrorCount = 0;
-  static double? _dnsRecoverSeconds;
-  static Completer<void>? _dnsGate;
-  static bool _dnsProbing = false;
-
-  /// 最近一次解析失败的主机名。
-  ///
-  /// 探针原先固定探 app 域名（`HttpString.appBaseUrl`），而真机上失败的是 api 域名——
-  /// 量出来的「恢复耗时」根本不属于失败的那条路，甚至可能出现「读数说好了、请求还在失败」。
-  static String? _dnsFailHost;
-
-  /// 这一轮故障期的「解析已恢复」还没通知出去。
-  static bool _dnsRecoveredPending = false;
-
-  /// 「解析恢复」的订阅者。
+  /// 「解析恢复」的订阅者：解析故障期的全部状态都在 [DnsRecovery] 里。
   ///
   /// 解析成片失败时，一批请求会在阶梯上一直等；但**已经放弃**的那些（阶梯走完、界面上
   /// 留了错误占位）没人再管它们，表现为「卡死在那儿，不自己好」。这里给一个恢复信号，
   /// 让视频页之类把先前落空的请求补回来，不必等用户切前台或退出重进。
-  static final List<void Function()> _dnsRecoveredListeners = [];
+  static void addDnsRecoveredListener(void Function() listener) =>
+      DnsRecovery.addListener(listener);
 
-  static void addDnsRecoveredListener(void Function() listener) {
-    if (!_dnsRecoveredListeners.contains(listener)) {
-      _dnsRecoveredListeners.add(listener);
-    }
-  }
-
-  static void removeDnsRecoveredListener(void Function() listener) {
-    _dnsRecoveredListeners.remove(listener);
-  }
-
-  /// 记一次「域名解析失败」。
-  static void noteDnsFailure([String? host]) {
-    _dnsErrorCount++;
-    if (host != null && host.isNotEmpty) {
-      _dnsFailHost = host;
-    }
-    _dnsRecoveredPending = true;
-    noteDnsNoticePending();
-    if (!_dnsProbing) _startDnsProbe();
-  }
-
-  /// 现在是否处于解析故障期；是的话返回一个「解析恢复即完成」的 future。
-  ///
-  /// 卡在解析失败上的请求靠它提前放行：不必睡满阶梯，解析一活过来就再发一次。
-  static Future<void>? dnsRecoveryGate() => _dnsProbing ? _dnsGate?.future : null;
-
-  /// 起一轮解析探针：每 1 秒试一次，量出「解析恢复正常」花了多久。
-  ///
-  /// 探的是**真正失败的那个域名**（见 [_dnsFailHost]）。解析失败是**成片**发生的：要么一次
-  /// 就成功，要么连着几十秒全失败（设备上常驻代理/VPN 时，隧道重建期间全部查询一起失败）。
-  /// 补偿重试的阶梯该设多长完全取决于这段空窗有多长，而真机上拿不到任何日志——所以只能在
-  /// 这里量，再把数字附在错误提示后面带回来。真机读数出现过「60 秒都没恢复」（`dn=17 dns=?`），
-  /// 说明空窗没有上界，所以量程放到 240 秒；到顶记 -1（读数显示 `>240s`）。
-  static void _startDnsProbe() {
-    final host = _dnsFailHost ?? Uri.parse(HttpString.appBaseUrl).host;
-    final startedAt = DateTime.now();
-    _dnsProbing = true;
-    _dnsRecoverSeconds = null;
-    _dnsGate ??= Completer<void>();
-    var attempts = 0;
-    Future<void> probe() async {
-      attempts++;
-      try {
-        await InternetAddress.lookup(host);
-        _dnsRecoverSeconds =
-            DateTime.now().difference(startedAt).inMilliseconds / 1000;
-        _finishDnsProbe();
-      } catch (_) {
-        if (attempts < 240) {
-          Timer(const Duration(seconds: 1), probe);
-        } else {
-          _dnsRecoverSeconds = -1;
-          _finishDnsProbe();
-        }
-      }
-    }
-
-    probe();
-  }
-
-  static void _finishDnsProbe() {
-    _dnsProbing = false;
-    final gate = _dnsGate;
-    _dnsGate = null;
-    if (gate != null && !gate.isCompleted) gate.complete();
-    if (!_dnsRecoveredPending) {
-      return;
-    }
-    _dnsRecoveredPending = false;
-    // 解析活过来了：下一轮故障期可以再跟用户说一次；订阅者（视频页等）把先前落空的请求补回来。
-    clearDnsNoticePending();
-    for (final listener in List.of(_dnsRecoveredListeners)) {
-      try {
-        listener();
-      } catch (_) {}
-    }
-  }
+  static void removeDnsRecoveredListener(void Function() listener) =>
+      DnsRecovery.removeListener(listener);
 
   /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
   ///
@@ -261,7 +171,9 @@ class Request {
     if (isDnsFailure(err)) {
       // 解析失败由 RetryInterceptor 在头一次看到时记过数（它跑在错误提示之前，读数才有
       // 意义）；这里只兜住「重试次数被设成 0、压根没装拦截器」的情况。
-      if (!_retryRecoveryInstalled) noteDnsFailure();
+      if (!_retryRecoveryInstalled) {
+        DnsRecovery.noteFailure(err.requestOptions.uri.host);
+      }
       return;
     }
     if (err.type != DioExceptionType.connectionError) {
@@ -303,9 +215,12 @@ class Request {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
     _resumedAt = DateTime.now();
-    // 回到前台后解析可能还没活过来：量一量它到底要多久，并把闸门武装上——卡在解析失败
-    // 上的请求因此会在恢复的瞬间就再试一次，而不是老实睡满阶梯。
-    if (!_dnsProbing) _startDnsProbe();
+    // 回到前台时，只有在**确实还有一个未结的解析故障期**时才接着探。
+    //
+    // 原先这里是无条件起探针（「顺便量一量」），等于每次切前台都往解析器上压一串查询，而
+    // 那一刻解析通常好好的；更糟的是，那串查询一旦挂住（老探针没有超时），就会凭空制造出
+    // 一个永不结束的故障期。现在探针只由真正的解析失败启动。
+    if (DnsRecovery.hasOpenFault) DnsRecovery.startProbe();
     if (backgroundedAt == null) {
       return;
     }
@@ -340,8 +255,9 @@ class Request {
   /// 连接问题的现场读数，会附在错误提示后面。
   ///
   /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
-  /// 次数、`dn` 累计域名解析失败次数、`dns` 采样时刻解析恢复正常花了多久
-  /// （`?` 表示还在量、`>240s` 表示 240 秒都没好）、`t` 距上次回到前台多久。
+  /// 次数、`t` 距上次回到前台多久；中间的 `dn/dns/px/rc` 来自 [DnsRecovery.diag]。
+  /// 其中 `dns` 若显示成只增不减的 `N s+`，说明探针那一行**卡住了**——老版本就是在这里
+  /// 把自己锁死的（探针不结束 ⇒ 恢复信号永不发出 ⇒ 只能退出重进）。
   static String connectionDiag() {
     final backgroundDuration = _lastBackgroundDuration;
     final resumedAt = _resumedAt;
@@ -351,13 +267,7 @@ class Request {
     final String sinceResume = resumedAt == null
         ? '-'
         : '+${(DateTime.now().difference(resumedAt).inMilliseconds / 1000).toStringAsFixed(1)}s';
-    final recover = _dnsRecoverSeconds;
-    final String dns = recover == null
-        ? '?'
-        : recover < 0
-        ? '>240s'
-        : '${recover.toStringAsFixed(1)}s';
-    return '[bg=$bg rb=$_rebuildCount dn=$_dnsErrorCount dns=$dns t=$sinceResume]';
+    return '[bg=$bg rb=$_rebuildCount ${DnsRecovery.diag()} t=$sinceResume]';
   }
 
   static void _onConnectivityChanged(List<ConnectivityResult> result) {
@@ -477,8 +387,8 @@ class Request {
           Pref.retryCount,
           Pref.retryDelay,
           recover: _recoverPoolForRetry,
-          onDnsError: noteDnsFailure,
-          dnsGate: dnsRecoveryGate,
+          onDnsError: DnsRecovery.noteFailure,
+          dnsGate: DnsRecovery.gate,
         ),
       );
     }
@@ -516,7 +426,12 @@ class Request {
     bool toastError = false,
   }) async {
     try {
-      return await send();
+      final response = await send();
+      // 请求真的成功了——这是「解析恢复」最硬的证据，比探针可信：不必等谁来批准，让停在
+      // 解析故障期里的那些请求（视频页的取流、评论……）立刻有机会补回来。自愈从此不再
+      // 依赖「探针会不会回来」这一件事。
+      DnsRecovery.noteSuccess();
+      return response;
     } on DioException catch (e) {
       _noteConnectionError(e);
       // 注意这里限定 connection：域名解析失败与连接池无关，换池再发一次纯属白费

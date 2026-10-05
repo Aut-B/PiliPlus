@@ -19,7 +19,7 @@ enum NetErrorKind { none, dns, connection }
 ///
 /// 解析失败是**成片**的：一轮故障期里几十个请求会接连报同一个错。逐个弹提示的结果是
 /// 屏幕上刷满绿条，用户还会把这条提示本身当成故障（真机截图里就是如此）。这里把提示收成
-/// 「每个故障期一次」，解析恢复后由探针重新放行（见 `Init._finishDnsProbe`）。
+/// 「每个故障期一次」，解析恢复后由 [DnsRecovery] 重新放行。
 bool _dnsNoticePending = false;
 
 /// 记下「这一轮解析故障期还没跟用户说过」。
