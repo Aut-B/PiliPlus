@@ -311,18 +311,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 只会看到「画面自己好了」，不知道是谁救的。
   final RxString dnsRecoverNote = RxString('');
 
+  /// 上一次取流失败曾把「自动播放」关掉，而这一次补偿重取又把它恢复回来。
+  ///
+  /// 单独记一笔是因为它的症状很有迷惑性：地址取到了、播放器也装了，只是停着不播，
+  /// 界面上一句报错都没有。见 `VideoDetailController.queryVideoUrl` 的 `resumePlay`。
+  final RxString autoResumeNote = RxString('');
+
+  /// 记下「补偿重取已恢复自动播放」。
+  void noteAutoResume() {
+    autoResumeNote.value = '上一次取流失败曾关掉自动播放，本次补偿重取已恢复';
+  }
+
   /// 有没有需要展示的现场读数。
   ///
   /// 读数原先只挂在「加载中」那个分支下面，于是「换集没接上」这种现场一个字也看
   /// 不到——此时既不在缓冲、也没有在播放，界面上没有任何提示。改成由这个 getter
   /// 决定：只要记过任何异常，就在播放区底部显示（见 `view.dart`）。
-  bool get hasDiagnostics =>
-      mediaError.value.isNotEmpty ||
-      mediaProbe.value.isNotEmpty ||
-      urlFixNote.value.isNotEmpty ||
-      cdnSwitchNote.value.isNotEmpty ||
-      dnsRecoverNote.value.isNotEmpty ||
-      episodeSwitchNote.value.isNotEmpty;
+  bool get hasDiagnostics {
+    // 正常播放时不打扰。
+    //
+    // mpv 在运行期会报一些**它自己就能恢复**的传输层日志——最典型的是切后台再回来时
+    // 某个连接已被系统或代理收走，于是 `tcp: ffurl_read returned 0xffffffc7`
+    // （= `-57`，socket 未连接）。此时画面照常在走、缓冲也够，用户完全无感。
+    // 但这条原话会被记进 [mediaError]，读数便一直挂在播放区——真机上用户看到的就是
+    // 「视频好好的，屏幕中间横着一行字」，反而以为软件坏了。
+    // 真正需要看的现场一定不满足「在播且不在缓冲」；原文在 [mediaDiagFull] 里照旧完整保留。
+    if (playerStatus.isPlaying && !isBuffering.value) {
+      return false;
+    }
+    return mediaError.value.isNotEmpty ||
+        mediaProbe.value.isNotEmpty ||
+        urlFixNote.value.isNotEmpty ||
+        cdnSwitchNote.value.isNotEmpty ||
+        dnsRecoverNote.value.isNotEmpty ||
+        autoResumeNote.value.isNotEmpty ||
+        episodeSwitchNote.value.isNotEmpty;
+  }
 
   /// 收下 mpv 的一句错误原文。
   ///
@@ -399,6 +423,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ..writeln('取流排队：${queryNote.value}')
       ..writeln('换集看门狗：${episodeSwitchNote.value}')
       ..writeln('解析恢复补发：${dnsRecoverNote.value}')
+      ..writeln('自动播放恢复：${autoResumeNote.value}')
       ..writeln(
         '播放状态：buffering=${isBuffering.value} '
         'buffered=${buffered.value} '
@@ -1347,6 +1372,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         cdnSwitchNote.value = '';
         episodeSwitchNote.value = '';
         dnsRecoverNote.value = '';
+        autoResumeNote.value = '';
         queryNote.value = '';
       }
       if (Platform.isIOS) {

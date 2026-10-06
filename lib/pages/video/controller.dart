@@ -789,6 +789,9 @@ class VideoDetailController extends GetxController
   /// 排队的那次请求是否带 fromReset（补发时原样带上）。
   bool _pendingQueryFromReset = false;
 
+  /// 排队的那次请求是否带 resumePlay（补发时原样带上）。
+  bool _pendingQueryResumePlay = false;
+
   /// 上一次取流是不是失败了（成功取到就复位）。用于回到前台时判断要不要静默重取。
   bool _playUrlFailed = false;
 
@@ -801,7 +804,8 @@ class VideoDetailController extends GetxController
   void retryPlayUrlIfFailed() {
     if (!_playUrlFailed || isFileSource || isQuerying) return;
     _playUrlFailed = false;
-    queryVideoUrl();
+    // 上一次是**失败**收场，那次失败已经把自动播放关掉了，所以这一次必须带 resumePlay。
+    queryVideoUrl(resumePlay: true);
   }
 
   /// 控制器是否已关闭。
@@ -833,16 +837,19 @@ class VideoDetailController extends GetxController
       return;
     }
     if (isQuerying) return;
+    // 画面正好好走着就什么都不做。mpv 的运行期噪音（例如后台期间某个连接被系统收走后的
+    // `tcp: ffurl_read returned …`，它会自己换一条连接继续读）也会留在 `mediaError` 里，
+    // 而它不是故障——照着它重取，只会把正在播放的视频打断重开。
+    if (player.playerStatus.isPlaying && !player.isBuffering.value) return;
     final failedPull = player.mediaError.value.isNotEmpty;
-    final nothingLoaded =
-        !failedPull && player.duration.value <= 0 && !player.playerStatus.isPlaying;
+    final nothingLoaded = !failedPull && player.duration.value <= 0;
     if (!failedPull && !nothingLoaded) return;
     // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
     // 真机上早验证过「点播放也没用」。
     player.dnsRecoverNote.value = failedPull
         ? '解析恢复：拉流失败，重新取流一次'
         : '解析恢复：播放器里空着，重新取流一次';
-    queryVideoUrl();
+    queryVideoUrl(resumePlay: true);
   }
 
   final languages = Rxn<List<LanguageItem>>();
@@ -887,6 +894,7 @@ class VideoDetailController extends GetxController
   Future<void> queryVideoUrl({
     bool fromReset = false,
     bool autoFullScreenFlag = false,
+    bool resumePlay = false,
   }) async {
     if (isFileSource) {
       return _initPlayerIfNeeded(autoFullScreenFlag);
@@ -899,27 +907,39 @@ class VideoDetailController extends GetxController
       // 所以换集的那一次不会落空。
       _pendingQuery = true;
       _pendingQueryFromReset = _pendingQueryFromReset || fromReset;
+      _pendingQueryResumePlay = _pendingQueryResumePlay || resumePlay;
       plPlayerController.noteQueryQueued();
       return;
     }
     isQuerying = true;
     try {
-      await _queryVideoUrl(fromReset, autoFullScreenFlag);
+      await _queryVideoUrl(fromReset, autoFullScreenFlag, resumePlay);
     } finally {
       isQuerying = false;
     }
     if (_pendingQuery) {
       _pendingQuery = false;
       final pendingFromReset = _pendingQueryFromReset;
+      final pendingResumePlay = _pendingQueryResumePlay;
       _pendingQueryFromReset = false;
+      _pendingQueryResumePlay = false;
       plPlayerController.noteQueryReissued();
       // 让这一轮彻底退栈后再补发，避免同帧递归。
-      scheduleMicrotask(() => queryVideoUrl(fromReset: pendingFromReset));
+      scheduleMicrotask(
+        () => queryVideoUrl(
+          fromReset: pendingFromReset,
+          resumePlay: pendingResumePlay,
+        ),
+      );
     }
   }
 
   @pragma('vm:prefer-inline')
-  Future<void> _queryVideoUrl(bool fromReset, bool autoFullScreenFlag) async {
+  Future<void> _queryVideoUrl(
+    bool fromReset,
+    bool autoFullScreenFlag,
+    bool resumePlay,
+  ) async {
     _playUrlFailed = false;
     if (plPlayerController.enableSponsorBlock && isBlock && !fromReset) {
       querySponsorBlock(bvid: bvid, cid: cid.value);
@@ -940,6 +960,17 @@ class VideoDetailController extends GetxController
 
     if (result case Success(:final response)) {
       data = response;
+      if (resumePlay && !_autoPlay.value) {
+        // 上一次取流失败把「要自动播」这件事关掉了（见下面的失败分支）。那是**当时那一轮**
+        // 的事实，却被写成了全局意图，而唯一会把它恢复回来的地方是「切换画质」。于是补偿
+        // 性的重取（换集看门狗、解析恢复、回到前台）即使把地址拿到了，`setDataSource`
+        // 也不会播——收尾里的 `if (_autoPlay) playIfExists()` 不成立，`_createVideoController`
+        // 又是用 `open(play: false)` 装源的。结果是新集装进了播放器却停在暂停态，位置还留在
+        // 上一集，既不报错也没有提示。真机上这就是「播完第四个，第五个接不上；看门狗说已经
+        // 重新取流，画面还是不动」。这一次是补偿，用户本来就在连播，把播放意图恢复回来。
+        _autoPlay.value = true;
+        plPlayerController.noteAutoResume();
+      }
       if (data.dash != null) await _supplementVideoQualities();
 
       languages.value = data.language?.items;
@@ -1067,6 +1098,8 @@ class VideoDetailController extends GetxController
       }
       await _initPlayerIfNeeded(autoFullScreenFlag);
     } else {
+      // 这一轮确实没得播，所以关掉自动播放。要留意它是**全局意图**而不是「本轮结果」——
+      // 任何补偿重取都必须带 `resumePlay: true` 才能把它恢复（见上面成功分支）。
       _playUrlFailed = true;
       _autoPlay.value = false;
       videoState.value = false;

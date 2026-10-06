@@ -131,6 +131,12 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   /// 换集后允许的接续时长。
   static const int _episodeSwitchWatchSeconds = 15;
 
+  /// 看门狗最多替用户补几次取流。网络长时间不通时不应变成无休止的重取。
+  static const int _maxEpisodeSwitchWatchRetries = 2;
+
+  /// 本集已经补过几次（每次新的换集重新归零）。
+  int _episodeSwitchWatchRetries = 0;
+
   /// 播完一集、已发起自动换集后，支一个看门狗。
   ///
   /// 「播完自动换集」这一次取流只有一次机会：引擎不会再自己发起，界面上也不会显示
@@ -160,7 +166,16 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
             ctr.durationInMilliseconds - ctr.positionInMilliseconds <= 1000;
         if (!stuckAtEnd && !ctr.dataStatus.error) return;
         ctr.noteEpisodeSwitchMissed(_episodeSwitchWatchSeconds);
-        videoDetailController.queryVideoUrl();
+        // `resumePlay` 必须带上：换集这一次取流往往是**先失败一次**（解析成片失败），
+        // 而失败会把自动播放关掉；不带它的话，重取即使成功也只是把新地址装进播放器、
+        // 停在暂停态——真机上就是「看门狗说已经重新取流，画面还是不动」。
+        videoDetailController.queryVideoUrl(resumePlay: true);
+        // 再盯一次：这一轮同样可能又落空（解析还没恢复）。限次，避免网络长期不通时
+        // 变成无休止的重取。
+        if (_episodeSwitchWatchRetries < _maxEpisodeSwitchWatchRetries) {
+          _episodeSwitchWatchRetries++;
+          _armEpisodeSwitchWatch();
+        }
       },
     );
   }
@@ -331,6 +346,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
             // 情况都要盯：已经发起了换集；以及列表循环里根本没发起。
             if (switched ||
                 plPlayerController!.playRepeat == PlayRepeat.listCycle) {
+              _episodeSwitchWatchRetries = 0;
               _armEpisodeSwitchWatch();
             }
           case PlayRepeat.pause:
