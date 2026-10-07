@@ -249,10 +249,115 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     }
   }
 
+  /// 拉流卡死看门狗。
+  ///
+  /// 取流（接口）成功、播放器也建好了，但 mpv 一个字节都拉不到时，界面会永远停在
+  /// 「加载中」。这时两级自愈都试过之后才轮到本看门狗：PiliPlus 自带的重试只调
+  /// `refreshPlayer()`，那是**拿同一个旧地址重开**；换 CDN 节点能换掉连不上的那一头，
+  /// 但那个机房如果是接口指定的、且形态不适合轮换，也未必救得回来。剩下的一步是
+  /// **重新取流**——重新调接口拿一份新地址与新签名。
+  ///
+  /// 顺序上先换节点再取流：换节点不花接口调用，且直接针对「这个机房连不上」。
+  ///
+  /// 只在「缓冲中 + 已缓冲 0 秒 + 正在播放」连续 20 秒时才动手，正常的起播缓冲不会
+  /// 误触发；两条路各自有上限，避免地址彻底不通时无限重试（计数都只在换集时归零）。
+  Timer? _stallTimer;
+  int _stallSeconds = 0;
+
+  /// 看门狗正在自愈中，避免上一轮还没做完就叠下一轮。
+  bool _stallBusy = false;
+
+  void _startStallWatch() {
+    _stallTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!mounted || _stallBusy) return;
+      final ctr = plPlayerController;
+      final stalled =
+          !ctr.isFileSource &&
+          ctr.isBuffering.value &&
+          ctr.buffered.value == 0 &&
+          ctr.playerStatus.isPlaying;
+      if (!stalled) {
+        _stallSeconds = 0;
+        return;
+      }
+      _stallSeconds += 5;
+      if (_stallSeconds < 20) return;
+      _stallSeconds = 0;
+      _stallBusy = true;
+      try {
+        // 先换 CDN 节点：这是设备自己就能做完的一步，不花接口调用，换掉的正是
+        // 连不上的那一头。换不动了（形态不适合轮换、次数已用满）才重新取流。
+        if (await ctr.switchMirror()) return;
+        if (ctr.mediaStallRetry.value >= 3) return;
+        final detailController = widget.videoDetailController;
+        if (detailController == null) return;
+        ctr.mediaStallRetry.value += 1;
+        detailController.queryVideoUrl();
+      } finally {
+        _stallBusy = false;
+      }
+    });
+  }
+
+  /// 现场读数的正文（每行一项，空项自动省略）。
+  ///
+  /// 依次是：播放源域名、换过的 CDN 节点、取流走到哪一步、取流请求排队记录、装源有没有
+  /// 真的交给播放器、换集未接上的记录、地址是否被规范化过、失败现场的网络探测结论、
+  /// mpv 报的原话。这几项合起来能把「接口没拿到地址」「地址畸形」「这个机房连不上」
+  /// 「换了机房还是连不上」「换了集没接上」「地址取了却没装源」「装源了却不播」
+  /// 「出口根本不通」分开。
+  ///
+  /// 每一项都带着自己写下去的时间（`〔+42s〕`）：**卡住这件事，读数的形态本身就该
+  /// 说出来**——「刚排队」与「排队排了五分钟」是两条完全不同的结论。
+  String get _diagText => [
+    if (plPlayerController.mediaSourceHost.isNotEmpty)
+      plPlayerController.mediaSourceHost,
+    if (plPlayerController.cdnSwitchNote.value.isNotEmpty)
+      '${plPlayerController.cdnSwitchNote.value}'
+      '${plPlayerController.noteAge('cdn')}',
+    if (plPlayerController.queryStage.value.isNotEmpty)
+      '取流阶段：${plPlayerController.queryStage.value}'
+      '${plPlayerController.noteAge('stage')}',
+    if (plPlayerController.queryNote.value.isNotEmpty)
+      '${plPlayerController.queryNote.value}'
+      '${plPlayerController.noteAge('query')}',
+    if (plPlayerController.loadNote.value.isNotEmpty)
+      '${plPlayerController.loadNote.value}'
+      '${plPlayerController.noteAge('load')}',
+    if (plPlayerController.episodeSwitchNote.value.isNotEmpty)
+      '${plPlayerController.episodeSwitchNote.value}'
+      '${plPlayerController.noteAge('switch')}',
+    if (plPlayerController.dnsRecoverNote.value.isNotEmpty)
+      '${plPlayerController.dnsRecoverNote.value}'
+      '${plPlayerController.noteAge('dns')}',
+    if (plPlayerController.autoResumeNote.value.isNotEmpty)
+      '${plPlayerController.autoResumeNote.value}'
+      '${plPlayerController.noteAge('resume')}',
+    if (plPlayerController.urlFixNote.value.isNotEmpty)
+      plPlayerController.urlFixNote.value,
+    if (plPlayerController.mediaProbe.value.isNotEmpty)
+      plPlayerController.mediaProbe.value,
+    if (plPlayerController.mediaError.value.isNotEmpty)
+      plPlayerController.mediaError.value,
+  ].join('\n');
+
+  /// 把完整诊断整段复制到剪贴板。
+  ///
+  /// 屏上那几行为了不遮住画面必须收短（长 URL 尤其占地方），而真正要看全的是完整
+  /// 那一份——整条播放地址、mpv 的原始报错、以及失败现场自动做的那次网络探测。
+  /// 所以读数本身做成可点的：点一下整段带走，直接粘贴发送即可。
+  void _copyDiagnostics() {
+    unawaited(
+      Clipboard.setData(ClipboardData(text: plPlayerController.mediaDiagFull)),
+    );
+    SmartDialog.showToast('诊断信息已复制，可直接粘贴发送');
+  }
+
   @override
   void initState() {
     super.initState();
     addObserverMobile(this);
+    _startStallWatch();
 
     _controlsListener = plPlayerController.showControls.listen(
       _onControlChanged,
@@ -332,7 +437,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!plPlayerController.continuePlayInBackground.value) {
+    // 画中画需要在后台继续渲染画面，此时不按「后台播放」开关暂停。
+    if (!plPlayerController.continuePlayInBackground.value &&
+        !plPlayerController.isIOSPipKeepingAlive) {
       late final player = plPlayerController.videoPlayerController;
       if (const <AppLifecycleState>[.paused, .detached].contains(state)) {
         if (player != null && player.state.playing) {
@@ -374,6 +481,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
   @override
   void dispose() {
     removeObserverMobile(this);
+    _stallTimer?.cancel();
     _danmakuListener?.cancel();
     _tapGestureRecognizer.dispose();
     _longPressRecognizer?.dispose();
@@ -1907,10 +2015,14 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                       if (plPlayerController.isBuffering.value)
                         Obx(() {
                           final buffered = plPlayerController.buffered.value;
+                          final stallRetry =
+                              plPlayerController.mediaStallRetry.value;
                           if (buffered == 0) {
-                            return const Text(
-                              '加载中...',
-                              style: TextStyle(
+                            return Text(
+                              stallRetry > 0
+                                  ? '加载中...（已重新取流 $stallRetry 次）'
+                                  : '加载中...',
+                              style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 12,
                               ),
@@ -1924,6 +2036,35 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                             ),
                           );
                         }),
+                      // 拉流失败时的现场读数：当前 CDN 节点 + 有没有换过节点 +
+                      // 地址是否被规范化过 + mpv 报的原话。
+                      // 「接口拿不到地址」「地址畸形」「这个机房连不上」「换个机房还是
+                      // 连不上」在界面上长得一样，都是转圈；这几行是唯一能当场分开它们的
+                      // 判据，所以放在这里，一定看得见。
+                      Obx(() {
+                        if (plPlayerController.buffered.value != 0) {
+                          return const SizedBox.shrink();
+                        }
+                        final text = _diagText;
+                        if (text.isEmpty) return const SizedBox.shrink();
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _copyDiagnostics,
+                            child: Text(
+                              '$text\n（轻点复制完整诊断）',
+                              maxLines: 9,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 9,
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
                     ],
                   ),
                 ),
@@ -1991,6 +2132,40 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                   )
                 : const SizedBox.shrink();
           }),
+
+        /// 出问题时不再缩在「加载中」下面的那一份读数。
+        ///
+        /// 读数原先只挂在「加载中」那个分支里，而「播完换集没接上」这种现场既不在
+        /// 缓冲、也没有在播放，那个分支根本不渲染——于是画面上就是「黑屏 + 一个字都
+        /// 没有」，看不出是不通、被丢掉，还是压根没开始。这里再挂一处：只要记过任何
+        /// 异常，就一直显示在播放区底部（和用户会截图的那一屏同屏）；与「加载中」
+        /// 下的那份互斥，不会重复。
+        Obx(() {
+          if (!plPlayerController.hasDiagnostics) {
+            return const SizedBox.shrink();
+          }
+          final loadingShown =
+              plPlayerController.dataStatus.loading ||
+              (plPlayerController.isBuffering.value &&
+                  plPlayerController.playerStatus.isPlaying);
+          if (loadingShown) return const SizedBox.shrink();
+          return Positioned(
+            left: 8,
+            right: 8,
+            bottom: 56,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _copyDiagnostics,
+              child: Text(
+                '$_diagText\n（轻点复制完整诊断）',
+                maxLines: 9,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 9),
+              ),
+            ),
+          );
+        }),
       ],
     );
     if (PlatformUtils.isDesktop) {

@@ -1931,28 +1931,40 @@ class HeaderControlState extends State<HeaderControl>
                   ),
                 ),
                 if (Platform.isAndroid ||
+                    Platform.isIOS ||
                     (PlatformUtils.isDesktop && !isFullScreen))
-                  SizedBox(
-                    width: btnWidth,
-                    height: btnHeight,
-                    child: IconButton(
-                      tooltip: '画中画',
-                      style: btnStyle,
-                      onPressed: () {
-                        if (PlatformUtils.isDesktop) {
-                          plPlayerController.toggleDesktopPip();
-                          return;
-                        }
-                        if (AndroidHelper.isPipAvailable) {
-                          plPlayerController.enterPip();
-                        }
-                      },
-                      icon: const Icon(
-                        Icons.picture_in_picture_outlined,
-                        size: 19,
-                        color: Colors.white,
-                      ),
-                    ),
+                  Obx(
+                    () =>
+                        Platform.isIOS &&
+                                !plPlayerController.isIOSPipSupported.value
+                            ? const SizedBox.shrink()
+                            : SizedBox(
+                                width: btnWidth,
+                                height: btnHeight,
+                                child: IconButton(
+                                  tooltip: '画中画',
+                                  style: btnStyle,
+                                  onPressed: () {
+                                    if (Platform.isIOS) {
+                                      // iOS：系统级画中画（可悬浮于其它 App 之上）
+                                      plPlayerController.toggleIOSPip();
+                                      return;
+                                    }
+                                    if (PlatformUtils.isDesktop) {
+                                      plPlayerController.toggleDesktopPip();
+                                      return;
+                                    }
+                                    if (AndroidHelper.isPipAvailable) {
+                                      plPlayerController.enterPip();
+                                    }
+                                  },
+                                  icon: const Icon(
+                                    Icons.picture_in_picture_outlined,
+                                    size: 19,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
                   ),
                 SizedBox(
                   width: btnWidth,

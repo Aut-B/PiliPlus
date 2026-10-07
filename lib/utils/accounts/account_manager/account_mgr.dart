@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/http/api.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/http/net_error.dart';
 import 'package:PiliPlus/models/common/account_type.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/accounts/account.dart';
@@ -23,6 +24,9 @@ class AccountManager extends Interceptor {
   AccountManager();
 
   static String blockServer = Pref.blockServer;
+
+  /// 连接现场读数的提供者，由 [Request] 注入（临时诊断用，定位到原因后即可去掉）。
+  static String Function()? connectionDiag;
 
   static String getCookies(List<Cookie> cookies) {
     // Sort cookies by path (longer path first).
@@ -172,15 +176,94 @@ class AccountManager extends Interceptor {
       'biliimg.com',
       'site/getCoin',
     ];
-    String url = err.requestOptions.uri.toString();
+    final url = err.requestOptions.uri.toString();
     if (kDebugMode) debugPrint('🌹🌹ApiInterceptor: $url\n$err');
     if (skipShow.any(url.contains) ||
         (url.contains('skipSegments') && err.requestOptions.method == 'GET')) {
-      // skip
-    } else {
-      dioError(err).then((res) => SmartDialog.showToast(res + url));
+      return;
     }
+    // 域名解析失败单独给一条说明。
+    //
+    // 它不是「网络设置」出了问题，用户也没有任何可做的动作：设备上常驻代理/VPN 时，
+    // 隧道重建期间全部查询会一起失败。这里把网址省掉、把话说清楚。
+    //
+    // 措辞改过一次，原因值得记着：老版本说「恢复后会自动继续」，而支撑那句话的是
+    // 「请求会在拦截器里熬一条 4 分钟的阶梯 + 一支主动解析探针」。那套东西本身会制造
+    // 挂住的解析调用、把进程的解析能力榨干（真机现象：「整个软件都没网」），已经整体
+    // 拆除。现在解析失败是**当场失败**，所以话也照实说：稍后刷新即可——一次刷新就是
+    // 一次免费的探针，而且不花任何代价。
+    //
+    // 另外两点是从真机上学到的：① 这条提示本身被当成了「软件坏了」，所以措辞往轻里写；
+    // ② 一轮故障期里几十个请求会接连报同一个错，逐个弹就是刷屏，所以改成**每个故障期
+    // 只提示一次**（名额在解析恢复时放行，见 [DnsRecovery]）。
+    if (isDnsFailure(err)) {
+      final host = err.requestOptions.uri.host;
+      if (!takeDnsNotice()) return;
+      _show('网络解析暂时不通（$host），稍后刷新即可', seconds: 30, diag: true);
+      return;
+    }
+    dioError(err).then(
+      (res) => _show('$res${_connDetail(err)}${url.subLength(60)}', seconds: 3),
+    );
   }
+
+  /// 弹出错误提示；同一条文案在 [seconds] 秒内只弹一次。
+  ///
+  /// 同一条错误如果被高频重复触发（例如某个接口陷入重试循环），逐个弹出的结果是覆盖层
+  /// 堆满、把主线程一起拖住，用户也只会看到刷屏。
+  static void _show(
+    String msg, {
+    required int seconds,
+    bool diag = false,
+  }) {
+    final now = DateTime.now();
+    final lastAt = _lastToastAt;
+    if (msg == _lastToastMsg &&
+        lastAt != null &&
+        now.difference(lastAt) < Duration(seconds: seconds)) {
+      return;
+    }
+    _lastToastMsg = msg;
+    _lastToastAt = now;
+    final detail = diag ? ' ${connectionDiag?.call() ?? ''}' : '';
+    SmartDialog.showToast('$msg$detail');
+  }
+
+  /// 连接类错误附一段现场读数：底层异常原文 + 连接池/前后台的现场读数。
+  ///
+  /// 真机上拿不到日志，提示是唯一能带回现场的地方，所以先都塞在这里（临时诊断用）。
+  static String _connDetail(DioException err) {
+    switch (err.type) {
+      case .connectionError:
+      case .connectionTimeout:
+      case .sendTimeout:
+        break;
+      default:
+        return '';
+    }
+    final error = err.error;
+    final String raw = switch (error) {
+      null => '',
+      // 两个都带上：一个是 Dart 侧的说法，一个是系统 errno 的说法
+      SocketException(:final message, :final osError?) =>
+        '$message (${osError.message})',
+      SocketException(:final message) => message,
+      _ => error.toString(),
+    };
+    final buffer = StringBuffer();
+    if (raw.isNotEmpty) {
+      buffer.write(' [${raw.subLength(70)}]');
+    }
+    final diag = connectionDiag?.call();
+    if (diag != null && diag.isNotEmpty) {
+      buffer.write(' $diag');
+    }
+    return buffer.toString();
+  }
+
+  /// [toast] 的节流状态：上一条错误文案与弹出时刻。
+  static String? _lastToastMsg;
+  static DateTime? _lastToastAt;
 
   static Future<void> _saveCookies(Account account, Response response) async {
     final setCookies = response.headers[HttpHeaders.setCookieHeader];
@@ -254,7 +337,10 @@ class AccountManager extends Interceptor {
       case .cancel:
         return '请求已被取消，请重新请求';
       case .connectionError:
-        return '连接错误，请检查网络设置';
+        // 域名没解析出来和「连不上」在界面上长得一样，但用户能做的事完全不同：
+        // 前者只能等（设备上开着代理/VPN 时隧道重建期间会整段失败，几十秒后就自己好了），
+        // 说成「请检查网络设置」只会让人白折腾，所以这里分开说。
+        return isDnsFailure(error) ? '域名解析失败，正在自动重试' : '连接错误，请检查网络设置';
       case .connectionTimeout:
         return '网络连接超时，请检查网络设置';
       case .receiveTimeout:

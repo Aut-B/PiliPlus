@@ -4,7 +4,9 @@ import 'dart:io';
 
 import 'package:PiliPlus/http/api.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/http/dns_recovery.dart';
 import 'package:PiliPlus/http/loading_state.dart';
+import 'package:PiliPlus/http/net_error.dart';
 import 'package:PiliPlus/http/retry_interceptor.dart';
 import 'package:PiliPlus/http/user.dart';
 import 'package:PiliPlus/utils/accounts.dart';
@@ -118,6 +120,163 @@ class Request {
 
   static Timer? _networkChangeDebounce;
 
+  /// 进入后台的时刻（仅用于 [recoverConnectionsAfterBackground]）。
+  static DateTime? _backgroundedAt;
+
+  /// 记录 App 进入后台。
+  static void markBackgrounded() {
+    _backgroundedAt = DateTime.now();
+  }
+
+  /// 上一次后台停留时长、最近一次回到前台的时刻、累计重建连接池次数、
+  /// 最近一次重建/最近一次连接失败的时刻。前三个只用于 [connectionDiag]。
+  static Duration? _lastBackgroundDuration;
+  static DateTime? _resumedAt;
+  static int _rebuildCount = 0;
+  static DateTime? _lastRebuildAt;
+  static DateTime? _lastConnErrorAt;
+
+  /// [dio] 上是否装了带现场自愈能力的重试拦截器（装了就不必在 [Request._send] 再兜一次）。
+  static bool _retryRecoveryInstalled = false;
+
+  /// 连接失败的自愈窗口：累计次数与窗口起点、上次重建时刻。
+  static int _connErrorCount = 0;
+  static DateTime? _connErrorWindowStart;
+  static DateTime? _lastConnRecoverAt;
+
+  /// 「解析恢复」的订阅者：解析故障期的全部状态都在 [DnsRecovery] 里。
+  ///
+  /// 解析成片失败时，一批请求会当场失败、界面上留下错误占位，此后没人再管它们，表现为
+  /// 「卡死在那儿，不自己好」。这里给一个恢复信号，让视频页之类把先前的落空补回来，
+  /// 不必等用户切前台或退出重进。
+  ///
+  /// 信号的来源只有一个：**某个真实请求拿到了响应**。前几版还有一支主动解析探针在跑，
+  /// 意图是「解析一恢复就立刻放行」；它已经被整体拆除——探针本身就在制造挂住的解析调用，
+  /// 是「整个软件都没网」的元凶之一，详见 lib/http/dns_recovery.dart。
+  static void addDnsRecoveredListener(void Function() listener) =>
+      DnsRecovery.addListener(listener);
+
+  static void removeDnsRecoveredListener(void Function() listener) =>
+      DnsRecovery.removeListener(listener);
+
+  /// 记录一次「连接失败」，短时间成串出现时自动重建连接池。
+  ///
+  /// 画中画会让 App 带着活跃播放在后台停留很久，iOS 可能已经把这些 socket 收走，
+  /// 而连接池仍当作可用——于是错误成串出现（视频详情、评论、弹幕一起失败），
+  /// 并且不会自行恢复。原先唯一的出路是杀掉进程重开，这里把它降级为自动重建：
+  /// 10 秒内累计 8 次连接失败就重建一次，30 秒内最多重建一次（重建会中断在途请求，
+  /// 所以要限频）。
+  ///
+  /// **域名解析失败不算在内**：那种错误下 socket 从未建立，池子里没有可怪罪的连接，
+  /// 重建纯属无效动作（真机据此白跑过一轮：`Failed host lookup` 照样重建了连接池，
+  /// 提示分毫未变）。它由 [RetryInterceptor] 的慢速阶梯负责，这里只记数。
+  static void _noteConnectionError(DioException err) {
+    final now = DateTime.now();
+    if (isDnsFailure(err)) {
+      // 解析失败的正常记账在 [RetryInterceptor] 那边（它跑在错误提示之前，读数才有意义；
+      // 而且它要等短阶梯走完才报，把「抖一下」排除掉）。这里只兜住一种情况：重试次数被
+      // 设成 0、压根没装拦截器——那样就没人记账了。
+      if (!_retryRecoveryInstalled) {
+        DnsRecovery.noteFailure(err.requestOptions.uri.host);
+      }
+      return;
+    }
+    if (err.type != DioExceptionType.connectionError) {
+      return;
+    }
+    _lastConnErrorAt = now;
+    final windowStart = _connErrorWindowStart;
+    if (windowStart == null ||
+        now.difference(windowStart) > const Duration(seconds: 10)) {
+      _connErrorWindowStart = now;
+      _connErrorCount = 0;
+    }
+    _connErrorCount++;
+    if (_connErrorCount < 8) {
+      return;
+    }
+    final lastRecoverAt = _lastConnRecoverAt;
+    if (lastRecoverAt != null &&
+        now.difference(lastRecoverAt) < const Duration(seconds: 30)) {
+      return;
+    }
+    _lastConnRecoverAt = now;
+    _connErrorCount = 0;
+    _connErrorWindowStart = now;
+    _resetAdaptersForNetworkChange();
+  }
+
+  /// 回到前台时重建连接池。
+  ///
+  /// iOS 上 App 长时间处于后台后，系统可能已经把它的 socket 收走，而 dio 的连接池仍
+  /// 当作那些连接可用：新请求会被塞进这些死连接（报 `DioException.connectionError`），
+  /// 池里占满的槽位又会挡住新连接的建立。画中画正好是这个场景——App 带着活跃播放在
+  /// 后台待很久，一回到视频页就满屏「连接错误，请检查网络设置」，且只能靠重启恢复。
+  ///
+  /// 这里复用网络切换时那套重建逻辑（同一件事，只是触发条件不同）。停留时间很短时
+  /// 不动它，避免每次切前台都白白打断在途请求；关闭时不用 force，让在途请求自己跑完
+  /// （池里的空闲连接——也就是可能已经死掉的那些——会被立刻丢掉）。
+  static void recoverConnectionsAfterBackground() {
+    final backgroundedAt = _backgroundedAt;
+    _backgroundedAt = null;
+    _resumedAt = DateTime.now();
+    // 这里原先会「顺便起一支解析探针量一量」——已经删掉了，而且不只是删掉触发器。
+    //
+    // 那支探针（连同后来的每一版）都是**主动解析**：`InternetAddress.lookup` 在隧道半死
+    // 时会挂住且取消不了，占着线程不放，做多了会把进程的解析能力榨干。切前台这件事本身
+    // 不需要任何人去「量」：真回到有网的状态时，随便哪个请求成功就会广播恢复；没恢复时
+    // 多发几次解析也只会让情况更糟。详见 lib/http/dns_recovery.dart 抬头那一段。
+    if (backgroundedAt == null) {
+      return;
+    }
+    _lastBackgroundDuration = _resumedAt!.difference(backgroundedAt);
+    if (_lastBackgroundDuration! < const Duration(seconds: 15)) {
+      return;
+    }
+    _resetAdaptersForNetworkChange(force: false);
+  }
+
+  /// 连接失败后想再发一次之前先问这里：现在重发值不值得？
+  ///
+  /// 返回 true 表示可以重发（顺便保证池子里没有残留的死连接）；返回 false 表示刚有请求
+  /// 彻底失败过，多半是网络本身不通，重发只是白白增加请求量。
+  static bool _recoverPoolForRetry() {
+    final now = DateTime.now();
+    final lastConnErrorAt = _lastConnErrorAt;
+    if (lastConnErrorAt != null &&
+        now.difference(lastConnErrorAt) < const Duration(seconds: 2)) {
+      return false;
+    }
+    final lastRebuildAt = _lastRebuildAt;
+    if (lastRebuildAt == null ||
+        now.difference(lastRebuildAt) >= const Duration(seconds: 5)) {
+      // 只丢掉池里的空闲连接（也就是可能已经被系统收走的那些），不动在途请求——
+      // 用 force 会把同批请求一起打断，反而再制造一批连接错误。
+      _resetAdaptersForNetworkChange(force: false);
+    }
+    return true;
+  }
+
+  /// 连接问题的现场读数，会附在错误提示后面。
+  ///
+  /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
+  /// 次数、`t` 距上次回到前台多久；中间的 `dn/rc/fault/age` 来自 [DnsRecovery.diag]：
+  /// 确认的解析失败次数、由真实请求确认恢复的次数、故障期开关、故障期已经开了多久。
+  ///
+  /// 这里原先还有 `dns=`（探针时长）与 `px=`（解析调用超时次数）两项，现在没有了——
+  /// 探针已经整体拆除，读数里不再有「我们自己去解析」的痕迹。
+  static String connectionDiag() {
+    final backgroundDuration = _lastBackgroundDuration;
+    final resumedAt = _resumedAt;
+    final String bg = backgroundDuration == null
+        ? '-'
+        : '${backgroundDuration.inSeconds}s';
+    final String sinceResume = resumedAt == null
+        ? '-'
+        : '+${(DateTime.now().difference(resumedAt).inMilliseconds / 1000).toStringAsFixed(1)}s';
+    return '[bg=$bg rb=$_rebuildCount ${DnsRecovery.diag()} t=$sinceResume]';
+  }
+
   static void _onConnectivityChanged(List<ConnectivityResult> result) {
     if (listEquals(result, const [ConnectivityResult.none])) {
       return;
@@ -125,7 +284,7 @@ class Request {
     _networkChangeDebounce?.cancel();
     _networkChangeDebounce = Timer(
       const Duration(milliseconds: 500),
-      _resetAdaptersForNetworkChange,
+      () => _resetAdaptersForNetworkChange(),
     );
   }
 
@@ -177,21 +336,23 @@ class Request {
   }
 
   @pragma('vm:notify-debugger-on-exception')
-  static void _resetAdaptersForNetworkChange() {
+  static void _resetAdaptersForNetworkChange({bool force = true}) {
     try {
       final (h11, connectionManager) = _createPool();
       if (connectionManager != null) {
         (dio.httpClientAdapter as Http2Adapter)
-          ..connectionManager.close(force: true)
+          ..connectionManager.close(force: force)
           ..connectionManager = connectionManager
-          ..fallbackAdapter.close(force: true)
+          ..fallbackAdapter.close(force: force)
           ..fallbackAdapter = h11;
         _http11Dio?.httpClientAdapter = h11;
       } else {
         dio
-          ..httpClientAdapter.close(force: true)
+          ..httpClientAdapter.close(force: force)
           ..httpClientAdapter = h11;
       }
+      _rebuildCount++;
+      _lastRebuildAt = DateTime.now();
     } catch (_) {}
   }
 
@@ -226,8 +387,15 @@ class Request {
 
     // 先于其他Interceptor
     if (Pref.retryCount != 0) {
+      _retryRecoveryInstalled = true;
       dio.interceptors.add(
-        RetryInterceptor(dio, Pref.retryCount, Pref.retryDelay),
+        RetryInterceptor(
+          dio,
+          Pref.retryCount,
+          Pref.retryDelay,
+          recover: _recoverPoolForRetry,
+          onDnsError: DnsRecovery.noteFailure,
+        ),
       );
     }
 
@@ -249,6 +417,61 @@ class Request {
       };
 
     if (Platform.isIOS) _watchConnectivity();
+
+    // 错误提示后面附一段连接现场读数（临时诊断用，定位到原因后即可去掉）
+    AccountManager.connectionDiag = connectionDiag;
+  }
+
+  /// 发一个请求；连接类失败时允许「换一个干净的连接池再试一次」。
+  ///
+  /// 后台（画中画）待久了，dio 池里的连接可能已经被系统收走。这类失败重发一次就能
+  /// 恢复，没必要冒到用户眼前。真正断网时不会多试太多：[_recoverPoolForRetry]
+  /// 会拦掉成串失败；装了 [RetryInterceptor] 时这一步由它负责，这里不再兜。
+  static Future<Response> _send(
+    Future<Response> Function() send, {
+    bool toastError = false,
+  }) async {
+    try {
+      final response = await send();
+      // 请求真的成功了——这是「解析恢复」**唯一**的判据，比任何探针都可信：不必等谁来
+      // 批准，让停在解析故障期里的那些页面（视频页的取流、评论……）立刻有机会补回来。
+      //
+      // 探针被整体拆除之后，它从「主路径」变成了独木桥，所以这一步必须便宜：一次比较。
+      DnsRecovery.noteSuccess();
+      return response;
+    } on DioException catch (e) {
+      _noteConnectionError(e);
+      // 注意这里限定 connection：域名解析失败与连接池无关，换池再发一次纯属白费
+      // （真机上这么干过一整轮，提示分毫未变）。那一类由 RetryInterceptor 的慢速
+      // 阶梯负责；没装拦截器时（重试次数被设为 0）就让它如实失败。
+      if (!_retryRecoveryInstalled &&
+          classifyNetError(e) == NetErrorKind.connection &&
+          _recoverPoolForRetry()) {
+        try {
+          return await send();
+        } on DioException catch (retryError) {
+          _noteConnectionError(retryError);
+          return _failure(retryError, toastError: toastError);
+        }
+      }
+      return _failure(e, toastError: toastError);
+    }
+  }
+
+  /// 把 [DioException] 包装成调用方一直在用的那种「失败响应」。
+  static Future<Response> _failure(
+    DioException e, {
+    bool toastError = false,
+  }) async {
+    // POST 的错误提示走这里（ApiInterceptor 只对非 POST 请求弹提示）
+    if (toastError) AccountManager.toast(e);
+    return Response(
+      data: {
+        'message': await AccountManager.dioError(e),
+      }, // 将自定义 Map 数据赋值给 Response 的 data 属性
+      statusCode: e.response?.statusCode ?? -1,
+      requestOptions: e.requestOptions,
+    );
   }
 
   /*
@@ -259,24 +482,14 @@ class Request {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
-  }) async {
-    try {
-      return await dio.get<T>(
-        url,
-        queryParameters: queryParameters,
-        options: options,
-        cancelToken: cancelToken,
-      );
-    } on DioException catch (e) {
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        }, // 将自定义 Map 数据赋值给 Response 的 data 属性
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.get<T>(
+      url,
+      queryParameters: queryParameters,
+      options: options,
+      cancelToken: cancelToken,
+    ),
+  );
 
   /*
    * post请求
@@ -287,27 +500,16 @@ class Request {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
-  }) async {
-    // if (kDebugMode) debugPrint('post-data: $data');
-    try {
-      return await dio.post<T>(
-        url,
-        data: data,
-        queryParameters: queryParameters,
-        options: options,
-        cancelToken: cancelToken,
-      );
-    } on DioException catch (e) {
-      AccountManager.toast(e);
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        }, // 将自定义 Map 数据赋值给 Response 的 data 属性
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.post<T>(
+      url,
+      data: data,
+      queryParameters: queryParameters,
+      options: options,
+      cancelToken: cancelToken,
+    ),
+    toastError: true,
+  );
 
   /*
    * 下载文件
@@ -316,29 +518,9 @@ class Request {
     String urlPath,
     String savePath, {
     CancelToken? cancelToken,
-  }) async {
-    try {
-      return await dio.download(
-        urlPath,
-        savePath,
-        cancelToken: cancelToken,
-        // onReceiveProgress: (int count, int total) {
-        // 进度
-        // if (kDebugMode) debugPrint("$count $total");
-        // },
-      );
-      // if (kDebugMode) debugPrint('downloadFile success: ${response.data}');
-    } on DioException catch (e) {
-      // if (kDebugMode) debugPrint('downloadFile error: $e');
-      return Response(
-        data: {
-          'message': await AccountManager.dioError(e),
-        },
-        statusCode: e.response?.statusCode ?? -1,
-        requestOptions: e.requestOptions,
-      );
-    }
-  }
+  }) => _send(
+    () => dio.download(urlPath, savePath, cancelToken: cancelToken),
+  );
 
   static List<int> responseBytesDecoder(
     List<int> responseBytes,

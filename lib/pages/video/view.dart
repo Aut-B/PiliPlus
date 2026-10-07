@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:math';
 
@@ -50,6 +51,7 @@ import 'package:PiliPlus/pages/video/widgets/header_control.dart';
 import 'package:PiliPlus/pages/video/widgets/intro_layout.dart';
 import 'package:PiliPlus/pages/video/widgets/player_focus.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
+import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
@@ -58,6 +60,7 @@ import 'package:PiliPlus/plugin/pl_player/view/view.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
     show shutdownTimerService;
+import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/extension/scroll_controller_ext.dart';
@@ -125,6 +128,64 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       videoDetailController.plPlayerController.pipNoDanmaku;
 
   bool isShowing = true;
+
+  /// 换集看门狗：播完一集、已经发起自动换集后，给这一次「必须接上」留一个期限。
+  Timer? _episodeSwitchTimer;
+
+  /// 看门狗是为哪一集支起来的（期间又换了一集就不再动手）。
+  int? _episodeSwitchCid;
+
+  /// 换集后允许的接续时长。
+  static const int _episodeSwitchWatchSeconds = 15;
+
+  /// 看门狗最多替用户补几次取流。网络长时间不通时不应变成无休止的重取。
+  static const int _maxEpisodeSwitchWatchRetries = 2;
+
+  /// 本集已经补过几次（每次新的换集重新归零）。
+  int _episodeSwitchWatchRetries = 0;
+
+  /// 播完一集、已发起自动换集后，支一个看门狗。
+  ///
+  /// 「播完自动换集」这一次取流只有一次机会：引擎不会再自己发起，界面上也不会显示
+  /// 「加载中」（此时既不在缓冲、也没有在播放）。一旦没接上，现场就是黑屏、没声音、
+  /// 没提示，而且不会自愈，用户只能退出重进。这里补上「到底接上没有」的校验：到点仍
+  /// 停在上一集结尾（或取流本身失败了）就重新取流一次，并在界面上留一行读数。
+  void _armEpisodeSwitchWatch() {
+    _episodeSwitchTimer?.cancel();
+    final cid = videoDetailController.cid.value;
+    _episodeSwitchCid = cid;
+    _episodeSwitchTimer = Timer(
+      const Duration(seconds: _episodeSwitchWatchSeconds),
+      () {
+        if (!mounted || _episodeSwitchCid != cid) return;
+        final ctr = plPlayerController;
+        if (ctr == null) return;
+        // 正在播放 / 正在缓冲 / 正在把新地址交给播放器，都算接上了。
+        if (ctr.playerStatus.isPlaying ||
+            ctr.isBuffering.value ||
+            ctr.dataStatus.loading) {
+          return;
+        }
+        // 只在「确实该接而没接上」时动手：要么还停在上一集结尾，要么取流就失败了。
+        // 用户自己中途暂停不该被牵扯进来。
+        final stuckAtEnd =
+            ctr.durationInMilliseconds > 0 &&
+            ctr.durationInMilliseconds - ctr.positionInMilliseconds <= 1000;
+        if (!stuckAtEnd && !ctr.dataStatus.error) return;
+        ctr.noteEpisodeSwitchMissed(_episodeSwitchWatchSeconds);
+        // `resumePlay` 必须带上：换集这一次取流往往是**先失败一次**（解析成片失败），
+        // 而失败会把自动播放关掉；不带它的话，重取即使成功也只是把新地址装进播放器、
+        // 停在暂停态——真机上就是「看门狗说已经重新取流，画面还是不动」。
+        videoDetailController.queryVideoUrl(resumePlay: true);
+        // 再盯一次：这一轮同样可能又落空（解析还没恢复）。限次，避免网络长期不通时
+        // 变成无休止的重取。
+        if (_episodeSwitchWatchRetries < _maxEpisodeSwitchWatchRetries) {
+          _episodeSwitchWatchRetries++;
+          _armEpisodeSwitchWatch();
+        }
+      },
+    );
+  }
 
   bool get isFullScreen =>
       videoDetailController.plPlayerController.isFullScreen.value;
@@ -198,11 +259,19 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     final isResume = state == .resumed;
     final ctr = videoDetailController.plPlayerController..visible = isResume;
     if (isResume) {
+      // 画中画会让 App 带着活跃播放在后台停留很久。iOS 可能已经把这些 socket 收走，
+      // 而 dio 的连接池仍认为它们可用——回到视频页时就会满屏「连接错误」，且只能靠
+      // 重启恢复。这里在回到前台时重建一次连接池（后台停留很短时不动）。
+      Request.recoverConnectionsAfterBackground();
+      // 后台那段时间里域名解析也可能整段不可用，连播正好在此时换集的话取流就失败了。
+      // 回到前台静默重取一次（只在前一次确实失败时才动）。
+      videoDetailController.retryPlayUrlIfFailed();
       if (!ctr.showDanmaku) {
         introController.startTimer();
         ctr.showDanmaku = true;
       }
     } else if (state == .paused) {
+      Request.markBackgrounded();
       introController.cancelTimer();
       ctr.showDanmaku = false;
     }
@@ -279,7 +348,16 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
           case PlayRepeat.listOrder:
           case PlayRepeat.listCycle:
           case PlayRepeat.autoPlayRelated:
-            exitFlag = !introController.nextPlay();
+            // 换集这次取流只有一次机会，发起之后要有人盯着它到底接上没有。
+            final bool switched = introController.nextPlay();
+            exitFlag = !switched;
+            // 列表循环里「没有下一集」本身就是异常（本该绕回开头），所以下面两种
+            // 情况都要盯：已经发起了换集；以及列表循环里根本没发起。
+            if (switched ||
+                plPlayerController!.playRepeat == PlayRepeat.listCycle) {
+              _episodeSwitchWatchRetries = 0;
+              _armEpisodeSwitchWatch();
+            }
           case PlayRepeat.pause:
         }
       }
@@ -342,6 +420,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
   @override
   void dispose() {
+    _episodeSwitchTimer?.cancel();
     plPlayerController
       ?..removeStatusLister(playerListener)
       ..removePositionListener(positionListener);

@@ -34,6 +34,17 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 iOS
 
+      # 先单独做一次静态检查，再交给 Xcode。
+      # 这一步不是可有可无的：`flutter build ios` 在 CI 这种「stdout 不是终端」的环境下
+      # 会把 Dart 编译错误整条吞掉——构建脚本的 stdout 只有 hasTerminal 为真时才转发，
+      # 且转发时只挑小写 `error:`（Dart 前端报的是大写 `Error:`）；xcresult 里那条
+      # `Command PhaseScriptExecution failed with a nonzero exit code` 又被显式丢弃。
+      # 结果是构建失败、却只打印「requires a selected Development Team」这段与签名有关的
+      # 兜底文案（见 flutter_tools 的 _missingDevelopmentTeam），极易被误判成环境问题。
+      # 静态检查能把真实错误在 2 分钟内直接打出来。
+      - name: Analyze Dart
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib
+
       - name: Build iOS
         run: |
           flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub

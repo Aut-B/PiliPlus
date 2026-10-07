@@ -283,7 +283,9 @@ class PgcIntroController extends CommonIntroController {
         ..bvid = bvid
         ..aid = aid
         ..cid.value = cid
-        ..queryVideoUrl();
+        // 与 UGC 同理：换集是引擎发起的连播，必须带上 `resumePlay`，否则只要此前失败过
+        // 一次取流，新的一集就会连播放器都叫不动（画面不动、一句错都不报）。
+        ..queryVideoUrl(resumePlay: true);
       if (cover != null && cover.isNotEmpty) {
         videoDetailCtr.cover.value = cover;
       }
