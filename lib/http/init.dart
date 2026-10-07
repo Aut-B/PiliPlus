@@ -146,9 +146,13 @@ class Request {
 
   /// 「解析恢复」的订阅者：解析故障期的全部状态都在 [DnsRecovery] 里。
   ///
-  /// 解析成片失败时，一批请求会在阶梯上一直等；但**已经放弃**的那些（阶梯走完、界面上
-  /// 留了错误占位）没人再管它们，表现为「卡死在那儿，不自己好」。这里给一个恢复信号，
-  /// 让视频页之类把先前落空的请求补回来，不必等用户切前台或退出重进。
+  /// 解析成片失败时，一批请求会当场失败、界面上留下错误占位，此后没人再管它们，表现为
+  /// 「卡死在那儿，不自己好」。这里给一个恢复信号，让视频页之类把先前的落空补回来，
+  /// 不必等用户切前台或退出重进。
+  ///
+  /// 信号的来源只有一个：**某个真实请求拿到了响应**。前几版还有一支主动解析探针在跑，
+  /// 意图是「解析一恢复就立刻放行」；它已经被整体拆除——探针本身就在制造挂住的解析调用，
+  /// 是「整个软件都没网」的元凶之一，详见 lib/http/dns_recovery.dart。
   static void addDnsRecoveredListener(void Function() listener) =>
       DnsRecovery.addListener(listener);
 
@@ -169,8 +173,9 @@ class Request {
   static void _noteConnectionError(DioException err) {
     final now = DateTime.now();
     if (isDnsFailure(err)) {
-      // 解析失败由 RetryInterceptor 在头一次看到时记过数（它跑在错误提示之前，读数才有
-      // 意义）；这里只兜住「重试次数被设成 0、压根没装拦截器」的情况。
+      // 解析失败的正常记账在 [RetryInterceptor] 那边（它跑在错误提示之前，读数才有意义；
+      // 而且它要等短阶梯走完才报，把「抖一下」排除掉）。这里只兜住一种情况：重试次数被
+      // 设成 0、压根没装拦截器——那样就没人记账了。
       if (!_retryRecoveryInstalled) {
         DnsRecovery.noteFailure(err.requestOptions.uri.host);
       }
@@ -215,12 +220,12 @@ class Request {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
     _resumedAt = DateTime.now();
-    // 回到前台时，只有在**确实还有一个未结的解析故障期**时才接着探。
+    // 这里原先会「顺便起一支解析探针量一量」——已经删掉了，而且不只是删掉触发器。
     //
-    // 原先这里是无条件起探针（「顺便量一量」），等于每次切前台都往解析器上压一串查询，而
-    // 那一刻解析通常好好的；更糟的是，那串查询一旦挂住（老探针没有超时），就会凭空制造出
-    // 一个永不结束的故障期。现在探针只由真正的解析失败启动。
-    if (DnsRecovery.hasOpenFault) DnsRecovery.startProbe();
+    // 那支探针（连同后来的每一版）都是**主动解析**：`InternetAddress.lookup` 在隧道半死
+    // 时会挂住且取消不了，占着线程不放，做多了会把进程的解析能力榨干。切前台这件事本身
+    // 不需要任何人去「量」：真回到有网的状态时，随便哪个请求成功就会广播恢复；没恢复时
+    // 多发几次解析也只会让情况更糟。详见 lib/http/dns_recovery.dart 抬头那一段。
     if (backgroundedAt == null) {
       return;
     }
@@ -255,9 +260,11 @@ class Request {
   /// 连接问题的现场读数，会附在错误提示后面。
   ///
   /// `bg` 上一次后台停留多久（`-` 表示压根没收到进入后台的事件）、`rb` 累计重建连接池
-  /// 次数、`t` 距上次回到前台多久；中间的 `dn/dns/px/rc` 来自 [DnsRecovery.diag]。
-  /// 其中 `dns` 若显示成只增不减的 `N s+`，说明探针那一行**卡住了**——老版本就是在这里
-  /// 把自己锁死的（探针不结束 ⇒ 恢复信号永不发出 ⇒ 只能退出重进）。
+  /// 次数、`t` 距上次回到前台多久；中间的 `dn/rc/fault/age` 来自 [DnsRecovery.diag]：
+  /// 确认的解析失败次数、由真实请求确认恢复的次数、故障期开关、故障期已经开了多久。
+  ///
+  /// 这里原先还有 `dns=`（探针时长）与 `px=`（解析调用超时次数）两项，现在没有了——
+  /// 探针已经整体拆除，读数里不再有「我们自己去解析」的痕迹。
   static String connectionDiag() {
     final backgroundDuration = _lastBackgroundDuration;
     final resumedAt = _resumedAt;
@@ -388,7 +395,6 @@ class Request {
           Pref.retryDelay,
           recover: _recoverPoolForRetry,
           onDnsError: DnsRecovery.noteFailure,
-          dnsGate: DnsRecovery.gate,
         ),
       );
     }
@@ -427,9 +433,10 @@ class Request {
   }) async {
     try {
       final response = await send();
-      // 请求真的成功了——这是「解析恢复」最硬的证据，比探针可信：不必等谁来批准，让停在
-      // 解析故障期里的那些请求（视频页的取流、评论……）立刻有机会补回来。自愈从此不再
-      // 依赖「探针会不会回来」这一件事。
+      // 请求真的成功了——这是「解析恢复」**唯一**的判据，比任何探针都可信：不必等谁来
+      // 批准，让停在解析故障期里的那些页面（视频页的取流、评论……）立刻有机会补回来。
+      //
+      // 探针被整体拆除之后，它从「主路径」变成了独木桥，所以这一步必须便宜：一次比较。
       DnsRecovery.noteSuccess();
       return response;
     } on DioException catch (e) {

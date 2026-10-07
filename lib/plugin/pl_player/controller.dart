@@ -9,6 +9,7 @@ import 'package:PiliPlus/grpc/bilibili/community/service/dm/v1.pb.dart'
     show DanmakuElem;
 import 'package:PiliPlus/http/browser_ua.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/http/dns_recovery.dart';
 import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/account_type.dart';
@@ -514,8 +515,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 在失败现场对当前播放地址主动探一次（同一个地址只探一次）。
   ///
   /// 刻意**不阻塞**自愈流程：探测只是取证，该换节点换节点、该重取重取。
+  ///
+  /// 唯一的例外是**解析故障期**：探测的第一步就是把域名解析成 IP，而故障期里那一次
+  /// 解析很可能挂住、占着线程不放——这恰恰是当初把「局部变慢」放大成「整个软件没网」
+  /// 的做法。故障期里直接跳过，等某个真实请求成功、故障期结束之后再做（见
+  /// lib/http/dns_recovery.dart）。
   Future<void> runMediaProbe() async {
     if (_probing) return;
+    if (DnsRecovery.hasOpenFault) {
+      mediaProbe.value = '探测：解析故障期内不做主动探测';
+      return;
+    }
     final src = dataSource;
     if (src is! NetworkSource) return;
     final url = src.videoSource;

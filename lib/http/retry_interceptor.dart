@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:PiliPlus/http/dns_recovery.dart';
 import 'package:PiliPlus/http/net_error.dart';
 import 'package:dio/dio.dart';
 import 'package:http2/http2.dart';
@@ -13,45 +14,30 @@ class RetryInterceptor extends Interceptor {
   /// 返回 true 表示已经换了一个干净的连接池、值得再发一次。
   final bool Function()? recover;
 
-  /// 头一次看到域名解析失败时回调一次，带上**解析不出来的那个主机名**。
+  /// 短阶梯走完仍解析不出来时回调一次，带上**解析不出来的那个主机名**。
   ///
-  /// 由它来记数（而不是等错误冒到 [Request] 那一层再记）：拦截器跑在错误提示**之前**，
-  /// 这样提示里带回来的读数才是那一刻的真数——真机上正是这一点让 `dn` 一直是 0。
-  /// 主机名也要带过去：探针原先固定探 app 域名，而真机上失败的是 api 域名，量出来的
-  /// 「恢复耗时」根本不是失败那条路的。
+  /// 刻意不放在「头一次失败」那一刻：头一次失败只说明抖了一下，抖动在网络里是常态，
+  /// 每个都算一轮故障期的话读数与提示都会失真。等它熬过整条阶梯还不行，才算确认。
   final void Function(String host)? onDnsError;
 
-  /// 解析故障期的「闸门」：返回的 future 在解析恢复时完成，没有故障期时返回 null。
+  /// 域名解析失败的补偿重试阶梯（毫秒）。
   ///
-  /// 有了它，等待中的重试不必老实睡满阶梯——解析一恢复就立刻再发一次。这很要紧：真机上
-  /// 这段空窗比 16 秒更长，靠固定阶梯只能一路加长盲等；而"等恢复"最坏也只是等到空窗结束。
-  final Future<void>? Function()? dnsGate;
-
-  /// 域名解析失败的补偿重试阶梯（毫秒，累计约 4 分钟）。
+  /// **只有两档，累计 2.8 秒**。这一条是从「越长越好」改回来的，值得把两种想法都写下。
   ///
-  /// 单独一套，因为这与 [_count]/[_delay] 根本不是一回事：那套（默认 2 次 × 500ms）是为
-  /// 「偶发的连接抖动」准备的，总共只争取到 1.5 秒；而解析失败是**成片**发生的——系统
-  /// 解析服务在切前后台之后的头几十秒会整段不可用（设备上常驻代理/VPN 时尤其如此，隧道
-  /// 重建期间全部查询一起失败），1.5 秒的预算必然输掉这场赛跑。
+  /// 老想法：解析故障期可能很长（真机上见过 >60 秒），1.5 秒预算必然输掉这场赛跑，所以
+  /// 把阶梯拉到 10 档、累计 4 分钟，还配一支主动探针去测「恢复了没有」。
   ///
-  /// 长度是量出来的，而且是**往下量**的：先用 1.5 秒预算，报错卡在回前台后 +1.6s；
-  /// 换成 16 秒阶梯后，报错推到了 +9.0s，而那一刻解析探针仍未测出恢复；再加到约 51 秒，
-  /// 真机上照样看到报错——读数是 `dn=17 dns=?`，即那一轮故障期**连 60 秒都没恢复**。
-  /// 也就是说这个空窗的长度没有上界，只能把阶梯拉长到「比最坏情况更长」：现在约 4 分钟，
-  /// 并且闸门在解析一恢复的瞬间就放行，所以拉长阶梯并不会让正常情况变慢，只影响故障期。
-  /// 连接池对此无能为力，这一路全程不去动它。
-  static const _dnsRetryDelays = [
-    800,
-    2000,
-    4500,
-    9000,
-    15000,
-    20000,
-    30000,
-    45000,
-    60000,
-    60000,
-  ];
+  /// 那个想法忽略了一件事：**每一次重试都是一次新的 `getaddrinfo`**，而设备上常驻
+  /// 代理/VPN 时这个调用会挂住、且 Dart 取消不了（`.timeout()` 只让 Dart 侧不再等，
+  /// 底层仍占着线程）。十来个请求同时在飞，每个重试 10 次，就是上百个挂住的解析调用，
+  /// 会把进程的 IO 线程池与系统解析队列一起榨干——**连不需要解析的请求也发不出去**。
+  /// 真机现象是一句话：「我一返回视频，整个软件都没网」。修一个「短暂变慢」的问题，
+  /// 造出一个「全局瘫痪」的问题，这笔账怎么算都是亏的。
+  ///
+  /// 现在的取舍是明确的：**容忍「抖一下」（≤2.8 秒），不试图容忍「断一段」**。
+  /// 真断了就如实失败，让页面显示错误占位——那是**看得见**的失败，用户下拉刷新即可
+  /// 重试，而且一次刷新就是一次免费的探针；长阶梯换来的却是**看不见的卡死**。
+  static const _dnsRetryDelays = [800, 2000];
 
   RetryInterceptor(
     this._client,
@@ -59,27 +45,21 @@ class RetryInterceptor extends Interceptor {
     this._delay, {
     this.recover,
     this.onDnsError,
-    this.dnsGate,
   });
 
-  /// 等一会儿再发一次；若正处在解析故障期，解析一恢复就立刻发，不必等满延时。
+  /// 等一会儿再原样发一次。
   void _retryAfter(
     int milliseconds,
     DioException err,
     ErrorInterceptorHandler handler,
   ) {
-    var fired = false;
-    void fire() {
-      if (fired) return;
-      fired = true;
-      _client
+    Timer(
+      Duration(milliseconds: milliseconds),
+      () => _client
           .fetch(err.requestOptions)
           .then(handler.resolve)
-          .onError<DioException>((error, _) => handler.next(error));
-    }
-
-    Timer(Duration(milliseconds: milliseconds), fire);
-    dnsGate?.call()?.then((_) => fire());
+          .onError<DioException>((error, _) => handler.next(error)),
+    );
   }
 
   @override
@@ -134,17 +114,29 @@ class RetryInterceptor extends Interceptor {
           }
           final extra = err.requestOptions.extra;
 
-          // 域名解析失败单独走一条慢速阶梯：等 0.8 / 2 / 4.5 / 9 / 15 / 20 / 30 / 45 / 60 / 60 秒
-          // （累计约 4 分钟）再试，并且在「解析恢复」的瞬间就提前放行。这一路**不去动连接池**
-          // ——解析都没成功，池子里根本没有可怪罪的连接，重建只会白白打断同批在途请求。
+          // 域名解析失败：短阶梯试两次（共 2.8 秒），不行就如实失败。
+          //
+          // 这一路有两个与常规重试不同的地方，都是被真机教出来的：
+          //
+          // ① **故障期一旦确认，一次都不再重试**。此刻重试只是往已经堵住的解析队列上
+          //    再压一次，它不会让解析变好——真正能宣布「恢复」的证据只有一个，那就是
+          //    某个真实请求拿到了响应（见 [DnsRecovery.noteSuccess]）。快速失败让上层
+          //    立刻显示错误占位，用户下拉刷新就是一次免费的重试。
+          // ② **不去动连接池**：解析都没成功，池子里根本没有可怪罪的连接，重建只会白白
+          //    打断同批在途请求（这一条在真机上白跑过一整轮）。
           if (isDnsFailure(err)) {
+            if (DnsRecovery.hasOpenFault) {
+              return handler.next(err);
+            }
             final dns = (extra['_rd'] ??= 0) as int;
             if (dns < _dnsRetryDelays.length) {
               extra['_rd'] = dns + 1;
-              if (dns == 0) onDnsError?.call(err.requestOptions.uri.host);
               _retryAfter(_dnsRetryDelays[dns], err, handler);
               return;
             }
+            // 抖一下的可能性已经排除了（它熬满了整条阶梯）。到这一刻才报故障：后面来的
+            // 解析失败会走上面那条零重试的闸门，不再有一个请求接着一个请求地补发解析。
+            onDnsError?.call(err.requestOptions.uri.host);
             return handler.next(err);
           }
 
@@ -183,6 +175,5 @@ class RetryInterceptor extends Interceptor {
     delay ?? _delay,
     recover: recover,
     onDnsError: onDnsError,
-    dnsGate: dnsGate,
   );
 }
