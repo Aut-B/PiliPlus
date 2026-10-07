@@ -301,11 +301,41 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 也是证据**，所以每条读数都记下自己的时间，展示时算成 `〔+42s〕`。
   final Map<String, DateTime> _noteAt = <String, DateTime>{};
 
+  /// 读数年龄的「心跳」：只要还有读数在，就每秒动一次。
+  ///
+  /// `〔+42s〕` 不是 Rx，屏上那一份读数不会因为时间流逝自己重算——没有心跳时屏上会一直
+  /// 挂着写下去那一刻的 `〔+3s〕`，而实际已经过去五分钟。**读数自己骗人比没有读数更糟**，
+  /// 尤其是用户截图的那一屏正好是它。复制的完整诊断每次现算，不受影响。
+  final RxInt noteTick = RxInt(0);
+  Timer? _noteTickTimer;
+
+  /// 有读数在，就让心跳跑起来（没有读数时自己停）。
+  void _touchNoteTick() {
+    if (_noteAt.isEmpty) return;
+    _noteTickTimer ??= Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_noteAt.isEmpty) {
+        timer.cancel();
+        _noteTickTimer = null;
+        return;
+      }
+      noteTick.value++;
+    });
+  }
+
   /// 记下某条读数的时间戳。
-  void _stamp(String key) => _noteAt[key] = DateTime.now();
+  void _stamp(String key) {
+    _noteAt[key] = DateTime.now();
+    _touchNoteTick();
+  }
 
   /// 某条读数写下去多久了（展示用；没记过就是空串）。
-  String noteAge(String key) => formatNoteAge(_noteAt[key], DateTime.now());
+  String noteAge(String key) {
+    final at = _noteAt[key];
+    if (at == null) return '';
+    // 读一下心跳，好让屏上那一份跟着老（见 [noteTick]）。
+    noteTick.value;
+    return formatNoteAge(at, DateTime.now());
+  }
 
   /// 连同时间戳一起清掉一条读数。
   ///
