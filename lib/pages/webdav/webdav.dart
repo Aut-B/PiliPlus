@@ -93,7 +93,7 @@ class WebDav {
         await client.remove(path);
       } catch (_) {}
       await client.write(path, utf8.encode(data));
-      SmartDialog.showToast('备份成功');
+      SmartDialog.showToast('备份成功（已排除本机专属设置）');
     } catch (e) {
       SmartDialog.showToast('备份失败: $e');
     }
@@ -111,8 +111,15 @@ class WebDav {
     try {
       final path = '${config.directory}/${_getFileName()}';
       final data = await client.read(path);
-      await GStorage.importAllSettings(utf8.decode(data));
-      SmartDialog.showToast('恢复成功');
+      final preserved = await GStorage.importAllSettings(utf8.decode(data));
+      if (preserved.isEmpty) {
+        SmartDialog.showToast('恢复成功');
+      } else {
+        SmartDialog.showToast(
+          '恢复成功，${preserved.length} 项本机设置保留原值：'
+          '${preserved.take(3).join('、')}${preserved.length > 3 ? ' 等' : ''}',
+        );
+      }
     } catch (e) {
       SmartDialog.showToast('恢复失败: $e');
     }

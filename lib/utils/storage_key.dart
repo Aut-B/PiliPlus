@@ -243,6 +243,53 @@ abstract final class SettingBoxKey {
       appFont = 'appFont';
 }
 
+/// 不参与导出的设置键（`GStorage.exportAllSettings` 会剔除，导入时保留本机原值）。
+///
+/// 这些键的「正确取值」取决于**当前这台设备、当前这个网络、当前这份凭据或当前这套
+/// 窗口布局**，把另一台设备上的取值搬过来只会制造故障：真机反馈表明，用 WebDAV 同步
+/// 设置后会出现「画中画黑屏 / 取流失败」，而同一套设置在设置页里逐项手动填写则一切正常。
+abstract final class LocalOnlySettingKey {
+  static const Set<String> values = {
+    // 网络与线路：换一台机器或换一个网络，原值几乎必然失效
+    SettingBoxKey.enableSystemProxy,
+    SettingBoxKey.systemProxyHost,
+    SettingBoxKey.systemProxyPort,
+    SettingBoxKey.CDNService,
+    SettingBoxKey.disableAudioCDN,
+    SettingBoxKey.liveCdnUrl,
+    SettingBoxKey.enableHttp2,
+    SettingBoxKey.badCertificateCallback,
+    // 播放器在本机上的能力取值：与本机编解码器、屏幕刷新率绑定
+    SettingBoxKey.hardwareDecoding,
+    SettingBoxKey.videoSync,
+    SettingBoxKey.preferCodecs,
+    SettingBoxKey.preferCodecsCellular,
+    // 画中画与后台播放：三者必须同机自洽——`autoPiP` 同时是 iOS 的后台保活判据
+    // （`isIOSPipKeepingAlive`），跨设备同步只会造出互相打架的组合
+    SettingBoxKey.autoPiP,
+    SettingBoxKey.continuePlayInBackground,
+    SettingBoxKey.enableBackgroundPlay,
+    // 本机路径与凭据
+    SettingBoxKey.downloadPath,
+    SettingBoxKey.imageSavePath,
+    SettingBoxKey.webdavUri,
+    SettingBoxKey.webdavUsername,
+    SettingBoxKey.webdavPassword,
+    SettingBoxKey.webdavDirectory,
+    // 桌面窗口布局：只对取备份的那台机器有意义
+    SettingBoxKey.minimizeOnExit,
+    SettingBoxKey.windowSize,
+    SettingBoxKey.windowPosition,
+    SettingBoxKey.isWindowMaximized,
+    SettingBoxKey.showWindowTitleBar,
+    SettingBoxKey.desktopVolume,
+    SettingBoxKey.showTrayIcon,
+    SettingBoxKey.uiScale,
+  };
+
+  static bool contains(Object? key) => values.contains('$key');
+}
+
 abstract final class LocalCacheKey {
   static const String historyPause = 'historyPause',
       blackMids = 'blackMids',

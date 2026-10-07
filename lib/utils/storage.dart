@@ -10,6 +10,7 @@ import 'package:PiliPlus/utils/accounts/account_type_adapter.dart';
 import 'package:PiliPlus/utils/accounts/cookie_jar_adapter.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/set_int_adapter.dart';
+import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:hive_ce/hive.dart';
@@ -77,23 +78,53 @@ abstract final class GStorage {
     }
   }
 
+  /// 导出设置箱与视频箱，剔除 [LocalOnlySettingKey] 里的「本机专属」键。
   static String exportAllSettings() {
     return Utils.jsonEncoder.convert({
-      setting.name: setting.toMap(),
+      setting.name: <String, dynamic>{
+        for (final e in setting.toMap().entries)
+          if (!LocalOnlySettingKey.contains(e.key)) '${e.key}': e.value,
+      },
       video.name: video.toMap(),
     });
   }
 
-  static Future<void> importAllSettings(String data) =>
+  /// 导入设置，返回**被保留原值**的本机专属键（供调用方提示用）。
+  ///
+  /// 与旧实现的两点不同：
+  /// * 不再 `clear()`——备份里**没有**的键保持本机原值，而不是回落默认值；
+  /// * [LocalOnlySettingKey] 里的键一律跳过，备份里带过来也不覆盖本机。
+  static Future<List<String>> importAllSettings(String data) =>
       importAllJsonSettings(jsonDecode(data));
 
-  static Future<List<void>> importAllJsonSettings(
+  static Future<List<String>> importAllJsonSettings(
     Map<String, dynamic> map,
-  ) {
-    return Future.wait([
-      setting.clear().then((_) => setting.putAll(map[setting.name])),
-      video.clear().then((_) => video.putAll(map[video.name])),
-    ]);
+  ) async {
+    final preserved = <String>[];
+    final kept = <String, dynamic>{};
+    final rawSetting = map[setting.name];
+    if (rawSetting is Map) {
+      for (final e in rawSetting.entries) {
+        final key = '${e.key}';
+        if (LocalOnlySettingKey.contains(key)) {
+          // 凭据类的差异不给用户看，报了也是噪音
+          if (!key.startsWith('webdav') && setting.get(key) != e.value) {
+            preserved.add(key);
+          }
+        } else {
+          kept[key] = e.value;
+        }
+      }
+    }
+    await setting.putAll(kept);
+
+    final rawVideo = map[video.name];
+    if (rawVideo is Map) {
+      await video.putAll(<String, dynamic>{
+        for (final e in rawVideo.entries) '${e.key}': e.value,
+      });
+    }
+    return preserved;
   }
 
   static void regAdapter() {

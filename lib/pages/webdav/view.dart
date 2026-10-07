@@ -118,6 +118,18 @@ class _WebDavSettingPageState extends State<WebDavSettingPage> {
                 ),
               ],
             ),
+            const SizedBox(height: 20),
+            Text(
+              '同步范围：主题、界面、弹幕、手势、画质等偏好设置。\n'
+              '代理、CDN、画中画与后台播放开关、下载路径、WebDAV 凭据等'
+              '「换一台机器就该重设」的项不参与同步；恢复时只覆盖备份里有的键，'
+              '本机其余设置原样保留。',
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.5,
+                color: Theme.of(context).colorScheme.outline,
+              ),
+            ),
           ],
         ),
       ),
