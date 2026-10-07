@@ -294,6 +294,104 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 每条读数是什么时候写上去的，用来算「已经过去多久了」。
+  ///
+  /// 只写「取流请求排队中：上一轮还没结束」，看的人分不清这是「刚发生」还是「卡了
+  /// 五分钟」——而这两件事的结论完全相反：前者该等，后者是缺陷。**读数的形态本身
+  /// 也是证据**，所以每条读数都记下自己的时间，展示时算成 `〔+42s〕`。
+  final Map<String, DateTime> _noteAt = <String, DateTime>{};
+
+  /// 记下某条读数的时间戳。
+  void _stamp(String key) => _noteAt[key] = DateTime.now();
+
+  /// 某条读数写下去多久了（展示用；没记过就是空串）。
+  String noteAge(String key) => formatNoteAge(_noteAt[key], DateTime.now());
+
+  /// 连同时间戳一起清掉一条读数。
+  ///
+  /// 只清文字不清时间戳的话，空读数后面还会挂着上一个 `〔+42s〕`，看着像刚发生的事。
+  void _clearNote(String key, RxString note) {
+    note.value = '';
+    _noteAt.remove(key);
+  }
+
+  /// 清掉上一次的「装源」结论（新一轮取流开始时调用）。
+  void clearLoadNote() {
+    _clearNote('load', loadNote);
+    loadSkipped.value = false;
+  }
+
+  /// 把「写下去多久了」格式化成读数尾巴。
+  ///
+  /// `null`（这条读数没记过）必须返回空串，否则每条空读数都会拖一个莫名其妙的
+  /// `〔+0s〕`，反而把真读数淹掉。
+  static String formatNoteAge(DateTime? at, DateTime now) {
+    if (at == null) return '';
+    var seconds = now.difference(at).inSeconds;
+    if (seconds < 0) seconds = 0;
+    if (seconds < 60) return '〔+${seconds}s〕';
+    if (seconds < 3600) return '〔+${seconds ~/ 60}m${seconds % 60}s〕';
+    return '〔+${seconds ~/ 3600}h${(seconds % 3600) ~/ 60}m〕';
+  }
+
+  /// 这一轮取流走到哪一步了（空串表示没有在取流）。
+  ///
+  /// 「取流排队」只说明有一轮还没结束，没说它卡在哪一句：接口没回来、补取画质没
+  /// 回来、还是地址已经交给播放器了——这三种现场要修的地方完全不同。所以取流的
+  /// 每一步都往这里写一次，配上时间戳，「卡在哪、卡了多久」一目了然。
+  final RxString queryStage = RxString('');
+
+  /// 记下取流当前所处的阶段。
+  void noteQueryStage(String stage) {
+    queryStage.value = stage;
+    _stamp('stage');
+  }
+
+  /// 取流这一轮跑完了。只在确实走到「装源」时才收尾——没走到的那几种（自动播放已关、
+  /// 接口没给出地址）本身就是结论，不该被一句「完成」盖掉。
+  void finishQueryStage() {
+    if (queryStage.value != '装载播放器') return;
+    noteQueryStage('已交给播放器，本轮结束');
+  }
+
+  /// 「这一集到底有没有把地址交给播放器」（空串表示压根没走到装源这一步）。
+  ///
+  /// 有两个地方会**静默**跳过装源：`_initPlayerIfNeeded` 在「自动播放已关」且预加载
+  /// 条件不满足时直接返回，`setDataSource` 开头还有一个 `_playerCount == 0` 的早退。
+  /// 两种现场在界面上都是「地址取到了、画面不动、mpv 一句错都不报」，只有把「装源」
+  /// 记下来才分得开。带上 cid 是为了和 `视频源` 里的 cid 对得上。
+  final RxString loadNote = RxString('');
+
+  /// 记下「地址已交给播放器」。
+  void noteLoadRequested(int? cid) {
+    loadNote.value = '装源：已交给播放器 cid=$cid';
+    _stamp('load');
+    loadSkipped.value = false;
+  }
+
+  /// 记下「这一次没有装源」，并写明原因。
+  void noteLoadSkipped(int? cid, String why) {
+    loadNote.value = '装源：已跳过（$why）cid=$cid';
+    _stamp('load');
+    loadSkipped.value = true;
+  }
+
+  /// 这一次装源被静默跳过了（**只有这一种**才值得把读数顶到屏幕上）。
+  ///
+  /// 读数里同时记着「已交给播放器」这种正常结论，拿它当显示条件是自找麻烦——
+  /// 正常装一次源就会在画面上挂一行字。见 `hasDiagnostics`。
+  final RxBool loadSkipped = RxBool(false);
+
+  /// 视频页此刻的「自动播放」意图：true 表示下一次装源之后应当自己播起来。
+  ///
+  /// `_autoPlay` 住在视频页控制器里，一次失败的取流会把它关掉（那是「这一轮没得播」
+  /// 的结论，却被当成全局意图），而它同时还是装源的一道闸门。把它抄一份到读数上，
+  /// 「地址取了、装没装、装完播不播」三件事就能在同一张图上对起来。
+  final RxString autoPlayIntent = RxString('');
+
+  /// 记下当前的自动播放意图。
+  void noteAutoPlayIntent(bool value) => autoPlayIntent.value = (value ? 'true' : 'false');
+
   /// 「取流请求被排队 / 已补发」的记录（空串表示没有发生过）。
   ///
   /// 取流进行中再来的请求原先会被直接丢掉；「播完自动换集」那一次只有一次机会，
@@ -320,6 +418,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 记下「补偿重取已恢复自动播放」。
   void noteAutoResume() {
     autoResumeNote.value = '上一次取流失败曾关掉自动播放，本次补偿重取已恢复';
+    _stamp('resume');
   }
 
   /// 有没有需要展示的现场读数。
@@ -345,6 +444,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         cdnSwitchNote.value.isNotEmpty ||
         dnsRecoverNote.value.isNotEmpty ||
         autoResumeNote.value.isNotEmpty ||
+        loadSkipped.value ||
         episodeSwitchNote.value.isNotEmpty;
   }
 
@@ -418,14 +518,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     buf
       ..writeln('地址修复：${urlFixNote.value}')
-      ..writeln('换节点：${cdnSwitchNote.value}')
+      ..writeln('换节点：${cdnSwitchNote.value}${noteAge('cdn')}')
       ..writeln('重取次数：${mediaStallRetry.value}')
-      ..writeln('取流排队：${queryNote.value}')
-      ..writeln('换集看门狗：${episodeSwitchNote.value}')
-      ..writeln('解析恢复补发：${dnsRecoverNote.value}')
-      ..writeln('自动播放恢复：${autoResumeNote.value}')
+      ..writeln('取流阶段：${queryStage.value}${noteAge('stage')}')
+      ..writeln('取流排队：${queryNote.value}${noteAge('query')}')
+      ..writeln('装源：${loadNote.value}${noteAge('load')}')
+      ..writeln('换集看门狗：${episodeSwitchNote.value}${noteAge('switch')}')
+      ..writeln('解析恢复补发：${dnsRecoverNote.value}${noteAge('dns')}')
+      ..writeln('自动播放恢复：${autoResumeNote.value}${noteAge('resume')}')
+      ..writeln('自动播放意图：${autoPlayIntent.value}')
       ..writeln(
-        '播放状态：buffering=${isBuffering.value} '
+        '播放状态：status=${dataStatus.value} '
+        'buffering=${isBuffering.value} '
         'buffered=${buffered.value} '
         'playing=${playerStatus.isPlaying} '
         'position=${_videoPlayerController?.state.position} '
@@ -444,16 +548,41 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 记下「有一轮取流请求被排队」。
   void noteQueryQueued() {
     queryNote.value = '取流请求排队中：上一轮还没结束，已让它接在后面补发';
+    _stamp('query');
   }
 
   /// 记下「排队的那一轮取流已补发」。
   void noteQueryReissued() {
     queryNote.value = '上一轮取流请求曾被排队，现已补发';
+    _stamp('query');
+  }
+
+  /// 记下「取流这一轮抛异常了」。
+  ///
+  /// 取流链上任何一句抛出（拿到的东西不符合预期、播放器那侧的同步异常……）都会把链
+  /// 掐断，而收尾里「补发排队请求」那一步原先跑在保护区之外——一旦抛出就再也走不到，
+  /// 排进队列的那一次请求被永久丢掉，界面上一个字都不会显示。这类异常只会进
+  /// `debugPrint`，真机上根本看不到，所以在这里留一条：症状就是「什么都不报，也绝
+  /// 不会自己好」。
+  void noteQueryThrew(Object err, int streak) {
+    queryStage.value = '取流抛异常（连续 $streak 次）';
+    _stamp('stage');
+    queryNote.value =
+        '取流异常：${err.runtimeType}${err is Error ? '' : '：$err'}'
+        '${streak > 1 ? '（连续 $streak 次）' : ''}';
+    _stamp('query');
+  }
+
+  /// 记下「解析恢复后自动补了一次」。
+  void noteDnsRecover(String note) {
+    dnsRecoverNote.value = note;
+    _stamp('dns');
   }
 
   /// 记下「换集之后 [seconds] 秒仍未开始播放」。
   void noteEpisodeSwitchMissed(int seconds) {
     episodeSwitchNote.value = '换集后 $seconds 秒仍未开始播放，已重新取流';
+    _stamp('switch');
   }
 
   /// 当前机型 / 系统是否支持系统级画中画（iOS）。
@@ -1369,10 +1498,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _mediaRetryKey = retryKey;
         mediaStallRetry.value = 0;
         cdnSwitchCount.value = 0;
+        _noteAt.remove('cdn');
         cdnSwitchNote.value = '';
+        _noteAt.remove('switch');
         episodeSwitchNote.value = '';
+        _noteAt.remove('dns');
         dnsRecoverNote.value = '';
+        _noteAt.remove('resume');
         autoResumeNote.value = '';
+        _noteAt.remove('query');
         queryNote.value = '';
       }
       if (Platform.isIOS) {
@@ -1412,12 +1546,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
 
       if (_playerCount == 0) {
+        // 静默早退：这一集的地址到此为止，播放器一次都不会被叫到。现场看起来是
+        // 「地址取到了、画面不动、mpv 一句错都不报」，所以必须留一条读数。
+        noteLoadSkipped(cid, '播放器引用计数为 0');
+        noteQueryStage('未装源：播放器引用计数为 0');
         return;
       }
       // 配置Player 音轨、字幕等等
+      noteLoadRequested(cid);
       await _createVideoController(dataSource, seekTo, volume);
 
       if (_playerCount == 0) {
+        noteLoadSkipped(cid, '装源途中引用计数归 0');
+        noteQueryStage('未装源：装源途中引用计数归 0');
         _removeListeners();
         _videoPlayerController?.dispose();
         _videoPlayerController = null;
@@ -1668,6 +1809,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         host = Uri.parse(video).host;
       } catch (_) {}
       cdnSwitchNote.value = '已换 CDN 节点（第 ${cdnSwitchCount.value} 次）：$host';
+      _stamp('cdn');
       if (kDebugMode) {
         debugPrint('switchMirror -> $host');
       }

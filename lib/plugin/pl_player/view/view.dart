@@ -301,23 +301,38 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
 
   /// 现场读数的正文（每行一项，空项自动省略）。
   ///
-  /// 依次是：播放源域名、换过的 CDN 节点、取流请求排队记录、换集未接上的记录、
-  /// 地址是否被规范化过、失败现场的网络探测结论、mpv 报的原话。这几项合起来能把
-  /// 「接口没拿到地址」「地址畸形」「这个机房连不上」「换了机房还是连不上」
-  /// 「换了集没接上」「出口根本不通」分开。
+  /// 依次是：播放源域名、换过的 CDN 节点、取流走到哪一步、取流请求排队记录、装源有没有
+  /// 真的交给播放器、换集未接上的记录、地址是否被规范化过、失败现场的网络探测结论、
+  /// mpv 报的原话。这几项合起来能把「接口没拿到地址」「地址畸形」「这个机房连不上」
+  /// 「换了机房还是连不上」「换了集没接上」「地址取了却没装源」「装源了却不播」
+  /// 「出口根本不通」分开。
+  ///
+  /// 每一项都带着自己写下去的时间（`〔+42s〕`）：**卡住这件事，读数的形态本身就该
+  /// 说出来**——「刚排队」与「排队排了五分钟」是两条完全不同的结论。
   String get _diagText => [
     if (plPlayerController.mediaSourceHost.isNotEmpty)
       plPlayerController.mediaSourceHost,
     if (plPlayerController.cdnSwitchNote.value.isNotEmpty)
-      plPlayerController.cdnSwitchNote.value,
+      '${plPlayerController.cdnSwitchNote.value}'
+      '${plPlayerController.noteAge('cdn')}',
+    if (plPlayerController.queryStage.value.isNotEmpty)
+      '取流阶段：${plPlayerController.queryStage.value}'
+      '${plPlayerController.noteAge('stage')}',
     if (plPlayerController.queryNote.value.isNotEmpty)
-      plPlayerController.queryNote.value,
+      '${plPlayerController.queryNote.value}'
+      '${plPlayerController.noteAge('query')}',
+    if (plPlayerController.loadNote.value.isNotEmpty)
+      '${plPlayerController.loadNote.value}'
+      '${plPlayerController.noteAge('load')}',
     if (plPlayerController.episodeSwitchNote.value.isNotEmpty)
-      plPlayerController.episodeSwitchNote.value,
+      '${plPlayerController.episodeSwitchNote.value}'
+      '${plPlayerController.noteAge('switch')}',
     if (plPlayerController.dnsRecoverNote.value.isNotEmpty)
-      plPlayerController.dnsRecoverNote.value,
+      '${plPlayerController.dnsRecoverNote.value}'
+      '${plPlayerController.noteAge('dns')}',
     if (plPlayerController.autoResumeNote.value.isNotEmpty)
-      plPlayerController.autoResumeNote.value,
+      '${plPlayerController.autoResumeNote.value}'
+      '${plPlayerController.noteAge('resume')}',
     if (plPlayerController.urlFixNote.value.isNotEmpty)
       plPlayerController.urlFixNote.value,
     if (plPlayerController.mediaProbe.value.isNotEmpty)

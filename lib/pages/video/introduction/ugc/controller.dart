@@ -509,7 +509,10 @@ class UgcIntroController extends CommonIntroController with ReloadMixin {
         ..bvid = bvid
         ..aid = aid
         ..cid.value = cid
-        ..queryVideoUrl();
+        // 换集是引擎发起的连播，用户本来就在看——这里必须带上 `resumePlay`：只要之前有
+        // 任何一次取流失败过，「自动播放」就被永久关掉了，而它既是播放指令的来源，也是
+        // 装源的闸门，于是新的一集连播放器都不会被叫到（画面不动、一句错都不报）。
+        ..queryVideoUrl(resumePlay: true);
 
       if (this.bvid != bvid) {
         reload = true;

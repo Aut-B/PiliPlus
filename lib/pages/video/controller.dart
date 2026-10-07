@@ -538,7 +538,12 @@ class VideoDetailController extends GetxController
   bool get isFullScreen => plPlayerController.isFullScreen.value;
   @override
   bool get autoPlay => _autoPlay.value;
-  set autoPlay(bool value) => _autoPlay.value = value;
+  set autoPlay(bool value) {
+    _autoPlay.value = value;
+    // 界面（用户按了播放）把它打开——那它就不再是「被失败关掉的」，补偿重取不该再以
+    // 「恢复」的名义动它。
+    if (value) _autoPlayKilledByFailure = false;
+  }
   @override
   bool get preInitPlayer => plPlayerController.preInitPlayer;
   @override
@@ -682,6 +687,7 @@ class VideoDetailController extends GetxController
     final currentVideoQa = this.currentVideoQa.value;
     if (currentVideoQa == null) return;
     _autoPlay.value = true;
+    _autoPlayKilledByFailure = false;
     playedTime = plPlayerController.videoPlayerController?.state.position;
     plPlayerController
       ..isBuffering.value = false
@@ -703,15 +709,23 @@ class VideoDetailController extends GetxController
   }
 
   Future<void>? _initPlayerIfNeeded(bool autoFullScreenFlag) {
+    plPlayerController.noteAutoPlayIntent(_autoPlay.value);
     if (_autoPlay.value ||
         (plPlayerController.preInitPlayer && !plPlayerController.processing) &&
             (isFileSource
                 ? true
                 : videoPlayerKey.currentState?.mounted == true)) {
+      plPlayerController.noteQueryStage('装载播放器');
       return playerInit(
         autoFullScreenFlag: autoFullScreenFlag && _autoPlay.value,
       );
     }
+    // 静默返回：这一集连播放器都不会被叫到。现场看上去和「地址取到了但不播」一模一样
+    // ——画面不动、mpv 一句错都不报——所以必须留下一条读数。真机上的成因是「自动播放」
+    // 被上一次失败的取流关掉了，而它同时还是装源的闸门（见上面判断的第一项）。
+    plPlayerController
+      ..noteLoadSkipped(cid.value, '自动播放已关且预加载条件不满足')
+      ..noteQueryStage('未装源：自动播放已关');
     return null;
   }
 
@@ -792,6 +806,27 @@ class VideoDetailController extends GetxController
   /// 排队的那次请求是否带 resumePlay（补发时原样带上）。
   bool _pendingQueryResumePlay = false;
 
+  /// 「这一轮取流要把播放意图恢复回来」。
+  ///
+  /// 只要有任何一处这么要求过（补偿重取、换集看门狗、解析恢复），就置为 true，本轮
+  /// 结束时消费掉。**不能只看参数**：一次取流可能要在网络阶梯上熬上几分钟，而这几分钟
+  /// 里来的补偿请求只能排队等它结束——真机的现场就是「地址终于取回来了、也装进了播放器，
+  /// 可自动播放早被上一次失败关掉了」，排队那一轮的 `resumePlay` 要等本轮彻底结束才生效，
+  /// 白白再走一遍接口、再等一轮阶梯。让正在跑的这一轮也认这个意图，第一份地址到手时就能
+  /// 把播放恢复回来。
+  bool _resumePlayIntent = false;
+
+  /// 「自动播放」是不是**被一次失败的取流**关掉的（而不是用户自己关的）。
+  ///
+  /// 这个区别很要紧：`_autoPlay` 既是「装源之后要不要自己播」的意图，又是**装源的闸门**
+  /// （见 `_initPlayerIfNeeded` 的第一个条件）。用户把设置里的「自动播放」关掉时它是
+  /// false——那是**用户的意图**，补偿重取不该擅自替他打开；只有「本来在播、被一次失败
+  /// 关掉」这一种，才是补偿重取该恢复回来的。
+  bool _autoPlayKilledByFailure = false;
+
+  /// 取流链连续抛了几次异常（干净跑完一次就归零）。
+  int _queryThrowStreak = 0;
+
   /// 上一次取流是不是失败了（成功取到就复位）。用于回到前台时判断要不要静默重取。
   bool _playUrlFailed = false;
 
@@ -830,13 +865,19 @@ class VideoDetailController extends GetxController
   void _onDnsRecovered() {
     if (_disposed || isFileSource) return;
     final player = plPlayerController;
+    if (isQuerying) {
+      // 取流还在阶梯上熬着（也可能正卡在某一层，见 `RetryInterceptor` 的解析阶梯）。
+      // 这一轮迟早会给出结论，而它一旦成功就是我们要的结果——所以只把「恢复播放」的
+      // 意图交给它，不再排一次取流：多排一次会让刚装好的地址被重装一遍，画面白跳。
+      _resumePlayIntent = true;
+      player.noteDnsRecover('解析恢复：取流正在进行，已把「恢复播放」交给这一轮');
+      return;
+    }
     if (_playUrlFailed) {
-      if (isQuerying) return;
-      player.dnsRecoverNote.value = '解析恢复：自动补了一次取流';
+      player.noteDnsRecover('解析恢复：自动补了一次取流');
       retryPlayUrlIfFailed();
       return;
     }
-    if (isQuerying) return;
     // 画面正好好走着就什么都不做。mpv 的运行期噪音（例如后台期间某个连接被系统收走后的
     // `tcp: ffurl_read returned …`，它会自己换一条连接继续读）也会留在 `mediaError` 里，
     // 而它不是故障——照着它重取，只会把正在播放的视频打断重开。
@@ -846,9 +887,9 @@ class VideoDetailController extends GetxController
     if (!failedPull && !nothingLoaded) return;
     // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
     // 真机上早验证过「点播放也没用」。
-    player.dnsRecoverNote.value = failedPull
-        ? '解析恢复：拉流失败，重新取流一次'
-        : '解析恢复：播放器里空着，重新取流一次';
+    player.noteDnsRecover(
+      failedPull ? '解析恢复：拉流失败，重新取流一次' : '解析恢复：播放器里空着，重新取流一次',
+    );
     queryVideoUrl(resumePlay: true);
   }
 
@@ -899,6 +940,7 @@ class VideoDetailController extends GetxController
     if (isFileSource) {
       return _initPlayerIfNeeded(autoFullScreenFlag);
     }
+    _resumePlayIntent = _resumePlayIntent || resumePlay;
     if (isQuerying) {
       // 这里原来是直接 return，把这个请求丢掉。但「播完换集」这一次取流只有一次
       // 机会：引擎不会再自己发起，界面也不会显示「加载中」（此时既没在缓冲、也没在
@@ -914,10 +956,24 @@ class VideoDetailController extends GetxController
     isQuerying = true;
     try {
       await _queryVideoUrl(fromReset, autoFullScreenFlag, resumePlay);
+      _queryThrowStreak = 0;
+    } catch (err) {
+      // 取流链上任何一句抛出都会把它掐断。原先「补发排队请求」那一步跑在保护区之外，
+      // 一抛出就再也走不到：队列里那一次请求被永久丢掉，既没有读数也没有提示，而且
+      // 绝不会自己好。这里把异常收下来记进读数，并且照样走补发。
+      _queryThrowStreak++;
+      plPlayerController.noteQueryThrew(err, _queryThrowStreak);
+      if (kDebugMode) debugPrint('queryVideoUrl err: $err');
     } finally {
       isQuerying = false;
+      _resumePlayIntent = false;
     }
     if (_pendingQuery) {
+      if (_queryThrowStreak >= 3) {
+        // 连续抛异常时不再自动补发，否则会是「抛出 → 补发 → 再抛」的死循环。
+        // 待办留着不清，等下一次外部触发的、干净跑完的那一轮把它带走。
+        return;
+      }
       _pendingQuery = false;
       final pendingFromReset = _pendingQueryFromReset;
       final pendingResumePlay = _pendingQueryResumePlay;
@@ -941,6 +997,10 @@ class VideoDetailController extends GetxController
     bool resumePlay,
   ) async {
     _playUrlFailed = false;
+    plPlayerController
+      ..clearLoadNote()
+      ..noteAutoPlayIntent(_autoPlay.value)
+      ..noteQueryStage('请求接口');
     if (plPlayerController.enableSponsorBlock && isBlock && !fromReset) {
       querySponsorBlock(bvid: bvid, cid: cid.value);
     }
@@ -959,18 +1019,23 @@ class VideoDetailController extends GetxController
     final result = await _getVideoUrl(VideoQuality.hdrVivid.code);
 
     if (result case Success(:final response)) {
+      plPlayerController.noteQueryStage('补取画质');
       data = response;
-      if (resumePlay && !_autoPlay.value) {
+      if (_resumePlayIntent && _autoPlayKilledByFailure) {
         // 上一次取流失败把「要自动播」这件事关掉了（见下面的失败分支）。那是**当时那一轮**
         // 的事实，却被写成了全局意图，而唯一会把它恢复回来的地方是「切换画质」。于是补偿
         // 性的重取（换集看门狗、解析恢复、回到前台）即使把地址拿到了，`setDataSource`
         // 也不会播——收尾里的 `if (_autoPlay) playIfExists()` 不成立，`_createVideoController`
-        // 又是用 `open(play: false)` 装源的。结果是新集装进了播放器却停在暂停态，位置还留在
-        // 上一集，既不报错也没有提示。真机上这就是「播完第四个，第五个接不上；看门狗说已经
-        // 重新取流，画面还是不动」。这一次是补偿，用户本来就在连播，把播放意图恢复回来。
+        // 又是用 `open(play: false)` 装源的；更糟的是它同时还是**装源的闸门**
+        // （`_initPlayerIfNeeded`），关着的时候连播放器都不会被叫到。结果是新集既没装上，
+        // 也不报错。真机上这就是「播完第四个，第五个接不上；看门狗说已经重新取流，画面
+        // 还是不动」。这一次是补偿，而且这个意图确实是**上一次失败**关掉的（不是用户
+        // 自己关的），把它恢复回来。
         _autoPlay.value = true;
+        _autoPlayKilledByFailure = false;
         plPlayerController.noteAutoResume();
       }
+      plPlayerController.noteAutoPlayIntent(_autoPlay.value);
       if (data.dash != null) await _supplementVideoQualities();
 
       languages.value = data.language?.items;
@@ -1029,10 +1094,12 @@ class VideoDetailController extends GetxController
           currentDecodeFormats = VideoDecodeFormatType.AVC;
           currentVideoQa.value = videoQuality;
           await _initPlayerIfNeeded(autoFullScreenFlag);
+          plPlayerController.finishQueryStage();
           return;
         } else {
           SmartDialog.showToast('视频资源不存在');
           _autoPlay.value = false;
+          _autoPlayKilledByFailure = true;
           videoState.value = false;
           if (plPlayerController.isFullScreen.value) {
             plPlayerController.triggerFullScreen(status: false);
@@ -1097,11 +1164,18 @@ class VideoDetailController extends GetxController
         audioUrl = '';
       }
       await _initPlayerIfNeeded(autoFullScreenFlag);
+      plPlayerController.finishQueryStage();
     } else {
       // 这一轮确实没得播，所以关掉自动播放。要留意它是**全局意图**而不是「本轮结果」——
       // 任何补偿重取都必须带 `resumePlay: true` 才能把它恢复（见上面成功分支）。
       _playUrlFailed = true;
       _autoPlay.value = false;
+      _autoPlayKilledByFailure = true;
+      // 失败分支是**静默**的：只有一句 toast，几秒后连它也没了。把「接口这一轮没给出
+      // 可用地址」写进阶段读数，事后再看就知道卡在哪一步、卡了多久。
+      plPlayerController
+        ..noteQueryStage('接口未返回可用地址')
+        ..noteAutoPlayIntent(false);
       videoState.value = false;
       if (plPlayerController.isFullScreen.value) {
         plPlayerController.triggerFullScreen(status: false);
