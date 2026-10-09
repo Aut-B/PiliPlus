@@ -938,24 +938,49 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _releaseIOSPipHold() {
     if (!_iosPipHold) return;
     _iosPipHold = false;
-    // 「回到 App」时视频页需要一点时间重新挂载；若立刻回收，会出现
-    // 「页面刚打开、播放器已被销毁」。故延迟到页面挂载完成后再判断。
     if (_iosPipRestoring) {
       _iosPipRestoring = false;
-      Future<void>.delayed(
-        const Duration(milliseconds: 1200),
-        _doReleaseIOSPipHold,
-      );
+      // 「回到 App」会重新推起视频页，而页面挂载需要时间：早一步回收引用，
+      // 现场就是「页面刚打开、播放器已被销毁」——画面全黑、只剩声音还在。
+      // 原先用固定 1.2 秒延时赌页面挂得上；慢机型或网络卡时页面会晚于它，
+      // 于是改成一个有上限的等待：页面挂上了立刻回收，实在等不到（约 6 秒）
+      // 也照旧回收，不把引用永远留着。
+      _releaseIOSPipHoldAfterRestore(0);
       return;
     }
     _doReleaseIOSPipHold();
   }
 
+  /// 「回到 App」之后，等视频页挂载完成再回收画中画那份引用。
+  ///
+  /// 每 250 毫秒看一眼视频页是否已成为当前路由，最多看 24 次（约 6 秒）。
+  void _releaseIOSPipHoldAfterRestore(int attempt) {
+    if (_isCurrVideoPage || attempt >= 24) {
+      _doReleaseIOSPipHold();
+      return;
+    }
+    Future<void>.delayed(
+      const Duration(milliseconds: 250),
+      () => _releaseIOSPipHoldAfterRestore(attempt + 1),
+    );
+  }
+
   void _doReleaseIOSPipHold() {
+    // 视频页 / 直播间正显示在最前时**绝不销毁播放器**：它此刻正被这个页面使用，
+    // 销毁的直接后果就是画面全黑、只剩声音继续。本函数原先在「引用计数只剩 1」
+    // 时会径直走到 dispose()，而那一刻页面可能恰好就在前台（真机现象即
+    // 「从小窗回到视频页，画面是黑的，声音与弹幕都正常」）。这里只收回画中画
+    // 占的那一份引用；播放器本身交由页面自己的关闭流程回收。
+    if (_isCurrVideoPage) {
+      if (_playerCount > 1) {
+        _playerCount -= 1;
+      }
+      return;
+    }
     if (_playerCount > 1) {
       _playerCount -= 1;
     } else {
-      // 视频页已销毁，直接回收播放器
+      // 视频页确已销毁，直接回收播放器
       dispose();
     }
   }
