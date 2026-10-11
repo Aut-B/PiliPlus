@@ -57,6 +57,7 @@ import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:flutter/services.dart'
     show
         Clipboard,
@@ -788,6 +789,27 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 进入画中画时 +1、退出时 -1，保证离开视频页后播放器不被销毁。
   bool _iosPipHold = false;
 
+  /// 画面源代次。
+  ///
+  /// iOS 上「画面黑、声音与弹幕都正常」这类现象的成因是画面源与音频链路脱了钩：
+  /// 声音由播放器直接输出，画面却要经过 Flutter 纹理——一旦纹理换代（播放器
+  /// 重建、换集装源、画中画起停），界面上那块 `Texture` 拿着的还是旧的 id，
+  /// 就会一直黑，而声音照旧。画面源每换一代就把这个值 +1，界面据此重建一次
+  /// 画面，把新的一代接上去。
+  final RxInt videoEpoch = RxInt(0);
+
+  /// iOS 上此刻是否应当推迟「自动跳过」（空降助手）。
+  ///
+  /// 自动跳过会主动 seek，而 seek 与画中画的画面源切换存在竞态：小窗正在显示、
+  /// 或 App 已退到后台时发起 seek，真机上出现过「回到视频页后画面是黑的，声音
+  /// 与弹幕都正常」。这两种情形下把跳过推迟，回到前台且小窗收掉后立刻补做。
+  @override
+  bool get deferAutoSkip {
+    if (!Platform.isIOS) return false;
+    if (isIOSPip.value) return true;
+    return WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed;
+  }
+
   StreamSubscription<String>? _iosPipSub;
 
   StreamSubscription<String>? _iosPipErrorSub;
@@ -810,6 +832,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         case 'start':
           isIOSPip.value = true;
           _iosPipStartedEvent = true;
+          // 小窗接管画面：此后的一段画面由原生图层出示。小窗收起时画面要重新
+          // 回到应用内的纹理上，在这里换代，保证那一次重建一定发生。
+          videoEpoch.value += 1;
           // 自动进入（划回主屏幕）时同样要占住播放器引用，否则用户随后返回
           // 上一页会把播放器一起销毁。
           if (!_iosPipHold) {
@@ -825,6 +850,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         case 'stop':
           isIOSPip.value = false;
           _releaseIOSPipHold();
+          // 小窗收起、画面回到应用内：换一代，把这块画面重新接上。
+          videoEpoch.value += 1;
           // 若「后台画中画」仍开着，弹幕数据继续备着，等下一次自动进入。
           _syncIOSPipDanmaku(autoPiP);
           break;
@@ -975,6 +1002,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (_playerCount > 1) {
         _playerCount -= 1;
       }
+      // 从「回到 App」这条路回来的：小窗已经把画面交还出来，这里换代一次，
+      // 界面会重新读一遍纹理 id 与尺寸，把画面接上。
+      videoEpoch.value += 1;
       return;
     }
     if (_playerCount > 1) {
@@ -1651,6 +1681,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       position.value = buffered.value = seekTo?.inSeconds ?? 0;
 
       dataStatus.value = .loaded;
+
+      // 装源完成：画面源可能已经换了一代（首次创建播放器、换集、切清晰度），
+      // 让界面把画面重新接一遍。
+      videoEpoch.value += 1;
 
       if (autoFullScreenFlag && autoEnterFullScreen) {
         triggerFullScreen(status: true);

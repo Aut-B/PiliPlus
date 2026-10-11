@@ -1480,7 +1480,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
               ignoring: !plPlayerController.enableDragSubtitle,
               child: Obx(
                 () => SubtitleView(
-                  controller: videoController,
+                  // 画面源换代后（播放器重建、换集、画中画起停）字幕也要认新的
+                  // 那一个，否则字幕会挂在已经作废的控制器上。
+                  controller: plPlayerController.videoController ?? videoController,
                   configuration: plPlayerController.subtitleConfig.value,
                   enableDragSubtitle: plPlayerController.enableDragSubtitle,
                   onUpdatePadding: plPlayerController.onUpdatePadding,
@@ -2219,6 +2221,14 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             child: Obx(
               () {
                 final videoFit = plPlayerController.videoFit.value;
+                // 画面源换代（播放器重建、换集装源、画中画起停）时把这块画面整个
+                // 重建一次。`SimpleVideo` 只在建立时读一次控制器与尺寸，若不重建，
+                // 上一代的纹理 id 会一直留在界面上——声音与弹幕照旧，画面却全是黑的。
+                final epoch = plPlayerController.videoEpoch.value;
+                final videoSrc = plPlayerController.videoController;
+                if (videoSrc == null) {
+                  return const SizedBox();
+                }
                 return Transform.flip(
                   flipX: plPlayerController.flipX.value,
                   flipY: plPlayerController.flipY.value,
@@ -2226,7 +2236,8 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                     fit: videoFit.boxFit,
                     alignment: widget.alignment,
                     child: SimpleVideo(
-                      controller: plPlayerController.videoController!,
+                      key: ValueKey(epoch),
+                      controller: videoSrc,
                       fill: widget.fill,
                       aspectRatio: videoFit.aspectRatio,
                     ),

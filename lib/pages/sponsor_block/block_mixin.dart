@@ -33,6 +33,13 @@ mixin BlockConfigMixin {
       .toSet();
 
   Color _getColor(SegmentType segment) => blockColor[segment.index];
+
+  /// iOS 上此刻是否应当推迟「自动跳过」。
+  ///
+  /// 自动跳过会主动 seek，而 seek 与 iOS 画中画的画面源切换存在竞态——小窗正在
+  /// 显示、或 App 已经退到后台时发起 seek，真机上出现过「回到视频页后画面是黑的，
+  /// 声音与弹幕都正常」。默认不推迟，播放器侧会按画中画状态与前后台覆写它。
+  bool get deferAutoSkip => false;
 }
 
 mixin BlockMixin on GetxController {
@@ -46,6 +53,9 @@ mixin BlockMixin on GetxController {
   Timer? _skipTimer;
   late final listKey = GlobalKey<AnimatedListState>();
   late final List<Object> listData = [];
+
+  /// 因「小窗显示中 / App 不在前台」而被推迟的跳转目标（毫秒）。
+  int? _deferredSkipMs;
 
   RxString? get videoLabel => null;
   Player? get player;
@@ -83,6 +93,17 @@ mixin BlockMixin on GetxController {
       _blockListener?.cancel();
       _blockListener = player?.stream.position.listen((position) {
         int currentPos = position.inSeconds;
+        // 先前被推迟的那一跳：条件一解除（回到前台且小窗已收）立刻补上。
+        // 守在位置回调的最前面，且不要求跨秒——条件解除的那一刻，播放位置
+        // 未必刚好跨过一个整秒。
+        final deferred = _deferredSkipMs;
+        if (deferred != null && !blockConfig.deferAutoSkip) {
+          _deferredSkipMs = null;
+          // 期间用户可能已经自己拖过了这一段，这时再往回跳是帮倒忙。
+          if (position.inMilliseconds < deferred) {
+            seekTo(Duration(milliseconds: deferred), isSeek: false);
+          }
+        }
         if (currentPos != _lastBlockPos) {
           _lastBlockPos = currentPos;
           final msPos = currentPos * 1000;
@@ -94,12 +115,11 @@ mixin BlockMixin on GetxController {
             if (msPos <= item.segment.$1 && item.segment.$1 <= msPos + 1000) {
               switch (item.skipType) {
                 case SkipType.alwaysSkip:
-                  onSkip(item, isSeek: false);
+                  _skipSegment(item);
                   break;
                 case SkipType.skipOnce:
                   if (!item.hasSkipped) {
-                    item.hasSkipped = true;
-                    onSkip(item, isSeek: false);
+                    _skipSegment(item, markSkipped: true);
                   }
                   break;
                 case SkipType.skipManually:
@@ -151,6 +171,11 @@ mixin BlockMixin on GetxController {
                       switch (segmentModel.skipType) {
                         case SkipType.alwaysSkip:
                         case SkipType.skipOnce:
+                          // 小窗显示中 / App 在后台：先把这一跳记下，等条件解除再补做。
+                          if (blockConfig.deferAutoSkip) {
+                            _deferredSkipMs = segmentModel.segment.$2;
+                            break;
+                          }
                           segmentModel.hasSkipped = true;
                           if (!isFileSource && player!.state.playing) {
                             future = onSkip(segmentModel);
@@ -250,6 +275,22 @@ mixin BlockMixin on GetxController {
     if (isBlock && Pref.blockTrack) {
       SponsorBlock.viewedVideoSponsorTime(item.uuid);
     }
+  }
+
+  /// 命中一个跳过点时统一从这里走：能跳就跳，不能跳（小窗显示中 / App 不在
+  /// 前台）就记下来，等条件解除后补跳。
+  ///
+  /// [markSkipped] 为真时，只有真正跳了才记「已跳过」——被推迟的那一次不能
+  /// 记账，否则补跳的机会就没了。
+  void _skipSegment(SegmentModel item, {bool markSkipped = false}) {
+    if (blockConfig.deferAutoSkip) {
+      _deferredSkipMs = item.segment.$2;
+      return;
+    }
+    if (markSkipped) {
+      item.hasSkipped = true;
+    }
+    onSkip(item, isSeek: false);
   }
 
   Future<void> onSkip(
@@ -473,6 +514,7 @@ mixin BlockMixin on GetxController {
 
   void resetBlock() {
     cancelBlockListener();
+    _deferredSkipMs = null;
     _lastBlockPos = null;
     videoLabel?.value = '';
     _segmentList.clear();
