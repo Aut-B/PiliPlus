@@ -454,18 +454,35 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         lines.length > 2 ? '${lines.take(2).join('\n')}…' : message;
     _stamp('qerr');
   }
+
   /// 最近一次「域名解析不通」的读数（空串表示当前没有）。
   ///
   /// mpv 的 `tcp: Failed to resolve hostname <host>` 与 Dart 侧接口的解析失败是
-  /// 同一件事的两张脸：这个设备的解析此刻对某些主机名不给结果。单记一笔有三个用处：
-  /// ① 诊断面板上直接看到是哪个主机名；② 换 CDN 节点的候选主机名与接口下发的那个
-  /// 同属 `bilivideo.com`，解析不通时轮换基本是无效动作——上限随之降到 1，省下
-  /// 几次同样打不开的 open；③ 看门狗据此不再重新取流（同一个解析，重取一次也只会
-  /// 再失败一次），改为给用户一句能照着做的话。
+  /// 同一件事的两张脸：这个设备的解析此刻对某个主机名不给结果。用途只有一个——
+  /// **解释现场**：面板上直接看到是哪个主机名，看门狗最后那句提示也带上它。
+  ///
+  /// 它**不用来关掉自愈**。第 37 轮曾据它把换节点上限压到 1、并让看门狗跳过
+  /// 重新取流，理由是「候选主机名与接口下发的同属 `bilivideo.com`，解析不通时
+  /// 轮换等于原地踏步」。真机证明这个推理过宽：一台设备的解析出问题，往往先是
+  /// 个别主机名（那个机房被挡了、那条记录坏了），换节点与重新取流恰恰是仅剩的
+  /// 自救动作；而这一笔读数会一直留到换集，等于把自愈永久关掉——现场就成了
+  /// 「怎么弄都是一片黑」。装源成功时它会自动清掉（见 [setDataSource]）。
   final RxString dnsFailNote = RxString('');
 
   /// 换集时清掉（与其余拉流诊断一起，见 [setDataSource] 的归零段）。
   void _clearDnsFailNote() => _clearNote('dnsfail', dnsFailNote);
+
+  /// 进小窗后采到的一句结论（空串表示这次没采、或采到的是正常态）。
+  ///
+  /// 小窗黑屏可能断在好几处：喂帧通道根本没出帧、出帧但取不到画面、图层拒收
+  /// 样本、样本已送出但系统没把它接进小窗——四者的下一步完全不同，而屏上
+  /// 看起来都是「一个黑窗」。原生侧把这些计数都报得出来（见
+  /// `videoController.pictureInPictureDiagnostics()`），**只在结论异常时**才
+  /// 写进这里：正常看视频时不该挂一屏读数。
+  final RxString pipNote = RxString('');
+
+  /// [pipNote] 对应的完整读数（只进复制出来的那一份诊断，不上屏——屏上那句要短）。
+  final RxString pipDetail = RxString('');
 
   /// mpv 原文里「解析不通」的那一种：`tcp: Failed to resolve hostname <host>: …`。
   ///
@@ -520,6 +537,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         dnsRecoverNote.value.isNotEmpty ||
         dnsFailNote.value.isNotEmpty ||
         queryErrNote.value.isNotEmpty ||
+        pipNote.value.isNotEmpty ||
         autoResumeNote.value.isNotEmpty ||
         loadSkipped.value ||
         episodeSwitchNote.value.isNotEmpty;
@@ -624,6 +642,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ..writeln('换集看门狗：${episodeSwitchNote.value}${noteAge('switch')}')
       ..writeln('解析恢复补发：${dnsRecoverNote.value}${noteAge('dns')}')
       ..writeln('自动播放恢复：${autoResumeNote.value}${noteAge('resume')}')
+      ..writeln('小窗读数：${pipNote.value}${noteAge('pip')}')
+      ..writeln(pipDetail.value)
       ..writeln('自动播放意图：${autoPlayIntent.value}')
       ..writeln(
         '播放状态：status=${dataStatus.value} '
@@ -842,10 +862,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 画面源代次。
   ///
   /// iOS 上「画面黑、声音与弹幕都正常」这类现象的成因是画面源与音频链路脱了钩：
-  /// 声音由播放器直接输出，画面却要经过 Flutter 纹理——一旦纹理换代（播放器
-  /// 重建、换集装源、画中画起停），界面上那块 `Texture` 拿着的还是旧的 id，
-  /// 就会一直黑，而声音照旧。画面源每换一代就把这个值 +1，界面据此重建一次
-  /// 画面，把新的一代接上去。
+  /// 声音由播放器直接输出，画面却要经过 Flutter 纹理——一旦**装源**换了一代
+  /// （新建播放器、换集、切清晰度），界面上那块 `Texture` 拿着的还是旧的 id，
+  /// 就会一直黑，而声音照旧。装源完成时把这个值 +1，界面据此重建一次画面，
+  /// 把新的一代接上去。
+  ///
+  /// 只在**装源完成**（[setDataSource] 收到 `.loaded`）时 +1。画中画的起停**不**计
+  /// 在内：那两件事并没有换画面源，小窗的每一帧来自原生渲染回调，与 App 里那块
+  /// 画面控件无关（详见 `PictureInPicture.swift` 与 `VideoOutput.swift`）。
   final RxInt videoEpoch = RxInt(0);
 
   /// iOS 上此刻是否应当推迟「自动跳过」（空降助手）。
@@ -882,9 +906,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         case 'start':
           isIOSPip.value = true;
           _iosPipStartedEvent = true;
-          // 小窗接管画面：此后的一段画面由原生图层出示。小窗收起时画面要重新
-          // 回到应用内的纹理上，在这里换代，保证那一次重建一定发生。
-          videoEpoch.value += 1;
+          // 这里**不**换代。画面源并没有换，只是改由原生图层出示；而画中画的每一帧
+          // 本来就来自原生渲染回调（`VideoOutput._updateCallback` → `feedPictureInPicture`），
+          // 与 App 里那块 `SimpleVideo` 的存亡无关。在小窗接管画面的那一刻重建画面
+          // 控件，只会在小窗启动的窗口期里把这块画面连根拔掉一次，没有任何好处。
           // 自动进入（划回主屏幕）时同样要占住播放器引用，否则用户随后返回
           // 上一页会把播放器一起销毁。
           if (!_iosPipHold) {
@@ -900,8 +925,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         case 'stop':
           isIOSPip.value = false;
           _releaseIOSPipHold();
-          // 小窗收起、画面回到应用内：换一代，把这块画面重新接上。
-          videoEpoch.value += 1;
+          // 同上：小窗收起同样没有换画面源，不需要在这里重建画面控件。
           // 若「后台画中画」仍开着，弹幕数据继续备着，等下一次自动进入。
           _syncIOSPipDanmaku(autoPiP);
           break;
@@ -1052,9 +1076,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (_playerCount > 1) {
         _playerCount -= 1;
       }
-      // 从「回到 App」这条路回来的：小窗已经把画面交还出来，这里换代一次，
-      // 界面会重新读一遍纹理 id 与尺寸，把画面接上。
-      videoEpoch.value += 1;
       return;
     }
     if (_playerCount > 1) {
@@ -1164,9 +1185,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }),
     );
     unawaited(_checkIOSPipStart(videoController));
-    if (isLiveContainerMultitask) {
-      unawaited(_reportIOSPipDiagnostics(videoController));
-    }
+    // 无论哪种运行方式都采一次读数：小窗黑屏在普通模式下同样发生，而那时若
+    // 什么都不采，下次还是只能猜。多任务模式弹窗（另有画进画面的浮层），
+    // 其它情况静默，只在读数异常时留下一句（见 [_reportIOSPipDiagnostics]）。
+    unawaited(_reportIOSPipDiagnostics(videoController));
   }
 
   /// 启动兜底检查。
@@ -1200,12 +1222,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     );
   }
 
-  /// 真机排障：把画中画链路的诊断快照显示出来（仅多任务模式下调用）。
+  /// 真机排障：把画中画链路的诊断快照摆出来。
+  ///
+  /// 多任务模式下弹对话框（那里本来就把读数画进小窗画面）；其它情况只在读数
+  /// 对不上时留一句到 [pipNote]（详见该方法内的分支）。
   ///
   /// 小窗黑屏可能断在好几处：喂帧通道根本没出帧、出帧但取不到画面、图层拒收样本、
   /// 样本已送出但系统没把画面接进小窗——四者的处理方式完全不同。这里把原生侧的
   /// 计数一次摆出来，并给出一句结论，便于直接对着读数定位。
   Future<void> _reportIOSPipDiagnostics(VideoController videoController) async {
+    // 新一轮小窗开始，上一次的读数作废。
+    _clearNote('pip', pipNote);
+    pipDetail.value = '';
     await Future<void>.delayed(const Duration(seconds: 6));
     if (!isIOSPip.value) return;
     final info = await videoController.pictureInPictureDiagnostics();
@@ -1252,6 +1280,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         '画面源　已挂入层级 $hostAttached，落点 $hostOrigin，窗口 $windowBounds\n'
         'App 状态　$appState　·　音频会话活跃 $audioActive'
         '（另有音频在播放 $audioOther）';
+
+    if (!isLiveContainerMultitask) {
+      // 普通模式不弹窗——每进一次小窗弹一次对话框太吵。只在读数对不上时才留
+      // 痕迹：屏上给一句短的，剪贴板那份给完整的读数。小窗黑屏这件事，下一次
+      // 再遇到时至少能直接看出断在四段里的哪一段。
+      final looksFine =
+          layerReady && hostAttached && enqueued > 0 && copyNil == 0 && notReady == 0;
+      if (looksFine) return;
+      pipNote.value = '小窗异常：$verdict'
+          '（入队 $enqueued / 取帧失败 $copyNil / 拒收 $notReady）';
+      pipDetail.value = detail;
+      _stamp('pip');
+      return;
+    }
 
     await SmartDialog.show(
       animationType: SmartAnimationType.centerFade_otherSlide,
@@ -1739,6 +1781,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 让界面把画面重新接一遍。
       videoEpoch.value += 1;
 
+      // 这一轮装源成功了，上一次的「解析不通」读数就此作废——它只描述当时那一刻。
+      // 留着它既会污染诊断面板，又会让读的人（以及写读数的人）误以为故障还在。
+      _clearDnsFailNote();
+
       if (autoFullScreenFlag && autoEnterFullScreen) {
         triggerFullScreen(status: true);
       }
@@ -1945,13 +1991,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_switchingMirror) return false;
     if (isFileSource) return false;
     if (_videoPlayerController == null) return false;
-    // 解析不通时最多换一次。换节点的候选主机名（`upos-sz-mirror*.bilivideo.com`）
-    // 与接口下发的那个同属 `bilivideo.com`，解析这一关过不去时，换几次都是从一个
-    // 打不开的域名换到另一个——真机现场正是如此：连换三次，mpv 一句新错都不报
-    // （解析调用挂在那儿），位置恒为 0。留一次是排除「只有那一个主机名坏了」，
-    // 再多就是纯耗时间。
-    final limit = dnsFailNote.value.isNotEmpty ? 1 : maxCdnSwitch;
-    if (cdnSwitchCount.value >= limit) return false;
+    // 打满上限才收手，不再按「解析不通」提前降级。
+    //
+    // 第 37 轮曾据 mpv 的一句 `Failed to resolve hostname` 把上限压到 1，理由是
+    // 「候选主机名与接口下发的同属 bilivideo.com，解析不通时轮换等于原地踏步」。
+    // 这个推理只在**整片解析都挂了**时才成立：一台设备的解析出问题，往往先是
+    // 个别主机名（那个机房被运营商/代理挡了、那条 DNS 记录坏了），这时换节点
+    // 恰恰是最该做的一步。更麻烦的是那一笔读数会一直留到换集，等于把这条路
+    // 永久关掉——真机上就成了「怎么弄都是黑的」。读数只用来解释现场，不用来
+    // 关掉自愈。
+    if (cdnSwitchCount.value >= maxCdnSwitch) return false;
     final src = dataSource;
     if (src is! NetworkSource) return false;
 
@@ -2014,9 +2063,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _recoverUnreachableMedia() async {
     unawaited(runMediaProbe());
     if (!await switchMirror()) {
-      // 解析不通时原地重开（[refreshPlayer]）同样过不了这一关：它拿的是同一个
-      // 主机名。不白费这一次 open——提示与等待恢复由看门狗负责。
-      if (dnsFailNote.value.isNotEmpty) return;
+      // 换节点这条路走不通（形态不支持、或次数已满）才原地重开一次。
+      // 第 37 轮曾在「解析不通」时直接跳过这一步，结果是把最后一条自愈手段
+      // 也关掉了——重开拿的虽是同一个主机名，但那一笔读数只说明**某一个**
+      // 主机名当时解析不出来，不足以断定整条路都不通。
       await refreshPlayer();
     }
   }

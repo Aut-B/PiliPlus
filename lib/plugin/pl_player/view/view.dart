@@ -288,28 +288,32 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
         // 先换 CDN 节点：这是设备自己就能做完的一步，不花接口调用，换掉的正是
         // 连不上的那一头。换不动了（形态不适合轮换、次数已用满）才重新取流。
         if (await ctr.switchMirror()) return;
-        // 域名解析不通时，重新取流没有意义：接口请求同样要过解析这一关，再问一次
-        // 只会再失败一次，还把用户晾在卡死的画面前干等。该说的这时候是人话——
-        // 哪个主机名解析不通、该去检查什么。恢复之后 DnsRecovery 会通知视频页
-        // 自动把这一轮补上（见 VideoDetailController._onDnsRecovered），
-        // 所以「自动继续」这句话是算过数的。
-        final dnsFail = ctr.dnsFailNote.value;
-        if (dnsFail.isNotEmpty) {
-          EasyThrottle.throttle(
-            'stallWatch.dnsFail',
-            const Duration(seconds: 60),
-            () => SmartDialog.showToast(
-              '$dnsFail：请检查网络或代理/VPN，恢复后会自动继续',
-              displayTime: const Duration(seconds: 5),
-            ),
-          );
+        // 两条路都还有额度就继续试。**不要因为「解析不通」提前收手**：第 37 轮
+        // 提前过，实测是错的——mpv 报的是某一个主机名解析不出来，而重新取流会
+        // 拿到另一个机房的地址，那恰恰是当时唯一还能自救的动作。提前收手的代价
+        // 是画面永久停在黑屏上，用户除了杀进程没有别的出路。
+        final detailController = widget.videoDetailController;
+        if (ctr.mediaStallRetry.value < 3 && detailController != null) {
+          ctr.mediaStallRetry.value += 1;
+          detailController.queryVideoUrl();
           return;
         }
-        if (ctr.mediaStallRetry.value >= 3) return;
-        final detailController = widget.videoDetailController;
-        if (detailController == null) return;
-        ctr.mediaStallRetry.value += 1;
-        detailController.queryVideoUrl();
+        // 两条路都打满了才轮到「说人话」：把已知的那个主机名摆出来，并说明
+        // 恢复后会自动继续（这一句有 DnsRecovery → VideoDetailController
+        // ._onDnsRecovered 兜底，不是空话）。60 秒内只说一次。
+        final dnsFail = ctr.dnsFailNote.value;
+        EasyThrottle.throttle(
+          'stallWatch.hint',
+          const Duration(seconds: 60),
+          () => SmartDialog.showToast(
+            dnsFail.isEmpty
+                ? '拉流失败：换节点与重新取流都已试满，请检查网络或代理/VPN，'
+                      '恢复后会自动继续'
+                : '$dnsFail：换节点与重新取流都已试满，'
+                      '请检查网络或代理/VPN，恢复后会自动继续',
+            displayTime: const Duration(seconds: 5),
+          ),
+        );
       } finally {
         _stallBusy = false;
       }
@@ -344,6 +348,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     if (plPlayerController.dnsFailNote.value.isNotEmpty)
       '${plPlayerController.dnsFailNote.value}'
       '${plPlayerController.noteAge('dnsfail')}',
+    if (plPlayerController.pipNote.value.isNotEmpty)
+      '${plPlayerController.pipNote.value}'
+      '${plPlayerController.noteAge('pip')}',
     if (plPlayerController.loadNote.value.isNotEmpty)
       '${plPlayerController.loadNote.value}'
       '${plPlayerController.noteAge('load')}',
@@ -2244,14 +2251,17 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             child: Obx(
               () {
                 final videoFit = plPlayerController.videoFit.value;
-                // 画面源换代（播放器重建、换集装源、画中画起停）时把这块画面整个
-                // 重建一次。`SimpleVideo` 只在建立时读一次控制器与尺寸，若不重建，
-                // 上一代的纹理 id 会一直留在界面上——声音与弹幕照旧，画面却全是黑的。
+                // 装源完成时换一代（见 PlPlayerController.videoEpoch），把这块画面
+                // 重建一次，好让它重新读一遍纹理 id 与尺寸。**画中画的起停不计在内**：
+                // 那两件事没有换画面源，重建只会在小窗启动的窗口期里把这块画面连根
+                // 拔掉一次。小窗的每一帧本来就来自原生渲染回调，与它无关。
                 final epoch = plPlayerController.videoEpoch.value;
-                final videoSrc = plPlayerController.videoController;
-                if (videoSrc == null) {
-                  return const SizedBox();
-                }
+                // 换源过程中 plPlayerController.videoController 会短暂置空，此时退回
+                // 本 State 建立时记下的那一个。**不能收成空白**——Flutter 只对界面上
+                // 真的挂了 `Texture` 的那一路纹理取帧，收成空白会让这一路连帧都不再
+                // 被拉取。
+                final videoSrc =
+                    plPlayerController.videoController ?? videoController;
                 return Transform.flip(
                   flipX: plPlayerController.flipX.value,
                   flipY: plPlayerController.flipY.value,
