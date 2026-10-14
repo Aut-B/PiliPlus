@@ -288,6 +288,23 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
         // 先换 CDN 节点：这是设备自己就能做完的一步，不花接口调用，换掉的正是
         // 连不上的那一头。换不动了（形态不适合轮换、次数已用满）才重新取流。
         if (await ctr.switchMirror()) return;
+        // 域名解析不通时，重新取流没有意义：接口请求同样要过解析这一关，再问一次
+        // 只会再失败一次，还把用户晾在卡死的画面前干等。该说的这时候是人话——
+        // 哪个主机名解析不通、该去检查什么。恢复之后 DnsRecovery 会通知视频页
+        // 自动把这一轮补上（见 VideoDetailController._onDnsRecovered），
+        // 所以「自动继续」这句话是算过数的。
+        final dnsFail = ctr.dnsFailNote.value;
+        if (dnsFail.isNotEmpty) {
+          EasyThrottle.throttle(
+            'stallWatch.dnsFail',
+            const Duration(seconds: 60),
+            () => SmartDialog.showToast(
+              '$dnsFail：请检查网络或代理/VPN，恢复后会自动继续',
+              displayTime: const Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
         if (ctr.mediaStallRetry.value >= 3) return;
         final detailController = widget.videoDetailController;
         if (detailController == null) return;
@@ -321,6 +338,12 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     if (plPlayerController.queryNote.value.isNotEmpty)
       '${plPlayerController.queryNote.value}'
       '${plPlayerController.noteAge('query')}',
+    if (plPlayerController.queryErrNote.value.isNotEmpty)
+      '接口错误：${plPlayerController.queryErrNote.value}'
+      '${plPlayerController.noteAge('qerr')}',
+    if (plPlayerController.dnsFailNote.value.isNotEmpty)
+      '${plPlayerController.dnsFailNote.value}'
+      '${plPlayerController.noteAge('dnsfail')}',
     if (plPlayerController.loadNote.value.isNotEmpty)
       '${plPlayerController.loadNote.value}'
       '${plPlayerController.noteAge('load')}',

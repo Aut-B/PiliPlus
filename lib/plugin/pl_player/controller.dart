@@ -437,6 +437,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 落空就是黑屏且不自愈。这条记录用来留痕，只作正文行，不单独触发读数显示。
   final RxString queryNote = RxString('');
 
+  /// 取流接口这一轮失败的**原文**（空串表示没有发生过）。
+  ///
+  /// 阶段读数只有一句「接口未返回可用地址」，那是个没有原文的黑箱：域名解析失败、
+  /// 连接超时、B 站风控（code != 0）三种完全不同的根因，在屏幕上长得一模一样。
+  /// 把 `Error` 的 message 收下来——它至少能告诉下一轮该往哪个方向查。
+  ///
+  /// 堆栈只留前两行：`VideoHttp.videoUrl` 的兜底 catch 会把 `$e\n\n$s` 整条塞进来，
+  /// 而诊断文本是要整段复制走的，没必要为此占掉几十行。
+  final RxString queryErrNote = RxString('');
+
+  /// 记下接口这一轮失败的原文（收短后的）。
+  void noteQueryErr(String message) {
+    final lines = message.split('\n');
+    queryErrNote.value =
+        lines.length > 2 ? '${lines.take(2).join('\n')}…' : message;
+    _stamp('qerr');
+  }
+  /// 最近一次「域名解析不通」的读数（空串表示当前没有）。
+  ///
+  /// mpv 的 `tcp: Failed to resolve hostname <host>` 与 Dart 侧接口的解析失败是
+  /// 同一件事的两张脸：这个设备的解析此刻对某些主机名不给结果。单记一笔有三个用处：
+  /// ① 诊断面板上直接看到是哪个主机名；② 换 CDN 节点的候选主机名与接口下发的那个
+  /// 同属 `bilivideo.com`，解析不通时轮换基本是无效动作——上限随之降到 1，省下
+  /// 几次同样打不开的 open；③ 看门狗据此不再重新取流（同一个解析，重取一次也只会
+  /// 再失败一次），改为给用户一句能照着做的话。
+  final RxString dnsFailNote = RxString('');
+
+  /// 换集时清掉（与其余拉流诊断一起，见 [setDataSource] 的归零段）。
+  void _clearDnsFailNote() => _clearNote('dnsfail', dnsFailNote);
+
+  /// mpv 原文里「解析不通」的那一种：`tcp: Failed to resolve hostname <host>: …`。
+  ///
+  /// 只认这一种写法。连接超时（`Connection timed out`）、连接被收走
+  /// （`tcp: ffurl_read returned …`）都不算——那些换节点仍然可能有效。
+  static final _resolveFailRe = RegExp(r'Failed to resolve hostname ([^\s:]+)');
+
   /// 「换集之后迟迟没有接上播放」的记录（空串表示没有发生过）。
   final RxString episodeSwitchNote = RxString('');
 
@@ -482,6 +518,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         urlFixNote.value.isNotEmpty ||
         cdnSwitchNote.value.isNotEmpty ||
         dnsRecoverNote.value.isNotEmpty ||
+        dnsFailNote.value.isNotEmpty ||
+        queryErrNote.value.isNotEmpty ||
         autoResumeNote.value.isNotEmpty ||
         loadSkipped.value ||
         episodeSwitchNote.value.isNotEmpty;
@@ -495,9 +533,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _pushMediaError(String event) {
     if (event.isEmpty) return;
     if (_mediaErrBuf.isNotEmpty && _mediaErrBuf.last == event) return;
+    // 解析不通要单独留一笔：它是「换节点/重取为什么全都无效」的答案，也是给用户
+    // 的那句提示的来源（见 [dnsFailNote]）。
+    final resolveFail = _resolveFailRe.firstMatch(event);
+    if (resolveFail != null) {
+      dnsFailNote.value = '解析不通：${resolveFail.group(1)}';
+      _stamp('dnsfail');
+    }
     _mediaErrBuf.add(event);
-    if (_mediaErrBuf.length > 4) {
-      _mediaErrBuf.removeRange(0, _mediaErrBuf.length - 4);
+    if (_mediaErrBuf.length > 8) {
+      // 8 条而不是 4 条：换一轮 CDN 节点会连着报「解析失败 + Failed to open」
+      // 两组，4 条只够装下最初的现场，换过之后的失败全被挤掉——而那正是
+      // 「换了节点到底通没通」的唯一证据。
+      _mediaErrBuf.removeRange(0, _mediaErrBuf.length - 8);
     }
     mediaError.value = _mediaErrBuf.map(shortenMpvError).join('\n');
   }
@@ -570,6 +618,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ..writeln('重取次数：${mediaStallRetry.value}')
       ..writeln('取流阶段：${queryStage.value}${noteAge('stage')}')
       ..writeln('取流排队：${queryNote.value}${noteAge('query')}')
+      ..writeln('接口错误：${queryErrNote.value}${noteAge('qerr')}')
+      ..writeln('解析不通：${dnsFailNote.value}${noteAge('dnsfail')}')
       ..writeln('装源：${loadNote.value}${noteAge('load')}')
       ..writeln('换集看门狗：${episodeSwitchNote.value}${noteAge('switch')}')
       ..writeln('解析恢复补发：${dnsRecoverNote.value}${noteAge('dns')}')
@@ -1619,6 +1669,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         autoResumeNote.value = '';
         _noteAt.remove('query');
         queryNote.value = '';
+        _noteAt.remove('qerr');
+        queryErrNote.value = '';
+        _clearDnsFailNote();
       }
       if (Platform.isIOS) {
         if (isIOSPip.value) {
@@ -1892,7 +1945,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_switchingMirror) return false;
     if (isFileSource) return false;
     if (_videoPlayerController == null) return false;
-    if (cdnSwitchCount.value >= maxCdnSwitch) return false;
+    // 解析不通时最多换一次。换节点的候选主机名（`upos-sz-mirror*.bilivideo.com`）
+    // 与接口下发的那个同属 `bilivideo.com`，解析这一关过不去时，换几次都是从一个
+    // 打不开的域名换到另一个——真机现场正是如此：连换三次，mpv 一句新错都不报
+    // （解析调用挂在那儿），位置恒为 0。留一次是排除「只有那一个主机名坏了」，
+    // 再多就是纯耗时间。
+    final limit = dnsFailNote.value.isNotEmpty ? 1 : maxCdnSwitch;
+    if (cdnSwitchCount.value >= limit) return false;
     final src = dataSource;
     if (src is! NetworkSource) return false;
 
@@ -1930,7 +1989,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
       // 这条路径不经过 setDataSource 的收尾，没人替它续播。
       final seekTo = _videoPlayerController!.state.position;
-      await _createVideoController(next, seekTo, _volumeNorm);
+      try {
+        await _createVideoController(next, seekTo, _volumeNorm);
+      } catch (err) {
+        // 换节点后的 open 失败原先会顺着 unawaited / Timer 回调一路逃逸掉，
+        // 屏上与诊断里一个字都不留——现场就成了「换了节点，然后什么都不发生」。
+        // 记下来，让看门狗与事后都能看见这一次到底败在哪儿。
+        cdnSwitchNote.value =
+            '第 ${cdnSwitchCount.value} 次换节点未打开：${err.runtimeType}';
+        _stamp('cdn');
+        return false;
+      }
       await playIfExists();
       return true;
     } finally {
@@ -1945,6 +2014,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _recoverUnreachableMedia() async {
     unawaited(runMediaProbe());
     if (!await switchMirror()) {
+      // 解析不通时原地重开（[refreshPlayer]）同样过不了这一关：它拿的是同一个
+      // 主机名。不白费这一次 open——提示与等待恢复由看门狗负责。
+      if (dnsFailNote.value.isNotEmpty) return;
       await refreshPlayer();
     }
   }

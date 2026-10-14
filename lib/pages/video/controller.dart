@@ -1184,8 +1184,12 @@ class VideoDetailController extends GetxController
       _autoPlayKilledByFailure = true;
       // 失败分支是**静默**的：只有一句 toast，几秒后连它也没了。把「接口这一轮没给出
       // 可用地址」写进阶段读数，事后再看就知道卡在哪一步、卡了多久。
+      // 原文一并收下——「接口未返回可用地址」这个标题分不出域名解析失败、连接超时
+      // 和 B 站风控（code != 0），而这三者的下一步完全不同。[LoadingState.toString]
+      // 对失败态就是那句 errMsg，与 toast 显示的一致，照抄即可。
       plPlayerController
         ..noteQueryStage('接口未返回可用地址')
+        ..noteQueryErr(result.toString())
         ..noteAutoPlayIntent(false);
       videoState.value = false;
       if (plPlayerController.isFullScreen.value) {
