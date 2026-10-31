@@ -74,6 +74,11 @@ class MineController extends CommonDataController<FavFolderData, FavFolderData>
         }
       },
     ),
+    (
+      icon: Icons.play_circle_outline,
+      title: '抖音收藏',
+      onTap: () => Get.toNamed('/douyin'),
+    ),
   ];
 
   @override
