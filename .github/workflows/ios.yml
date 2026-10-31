@@ -1,6 +1,8 @@
 name: Build for iOS
 
 on:
+  push:
+    branches: ["feat/douyin-ios15"]
   workflow_call:
     inputs:
       tag:
