@@ -6,6 +6,7 @@ import 'package:PiliPlus/pages/bubble/view.dart';
 import 'package:PiliPlus/pages/danmaku_block/view.dart';
 import 'package:PiliPlus/pages/dlna/view.dart';
 import 'package:PiliPlus/pages/download/download/view.dart';
+import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/view.dart';
 import 'package:PiliPlus/pages/dynamics/view.dart';
 import 'package:PiliPlus/pages/dynamics_create_vote/view.dart';
@@ -90,7 +91,18 @@ class Routes {
     GetPage(name: '/favDetail', page: () => const FavDetailPage()),
     // 稍后再看
     GetPage(name: '/later', page: () => const LaterPage()),
-    GetPage(name: '/douyin', page: () => const DouyinFavoritesPage()),
+    GetPage(
+      name: '/douyin',
+      page: () => const ShortVideoFavoritesPage(
+        platform: ShortVideoPlatform.douyin,
+      ),
+    ),
+    GetPage(
+      name: '/tiktok',
+      page: () => const ShortVideoFavoritesPage(
+        platform: ShortVideoPlatform.tiktok,
+      ),
+    ),
     // 历史记录
     GetPage(name: '/history', page: () => const HistoryPage()),
     // 搜索页面

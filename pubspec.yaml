@@ -217,9 +217,10 @@ dependency_overrides:
       ref: native
   media_kit_video:
     git:
-      url: https://github.com/Aut-B/media-kit.git
+      # 补帧修好 6S 小窗重复同一帧的那版（分支 pip-6s）。
+      url: https://github.com/Aut-B/Kazumi-media-kit.git
       path: media_kit_video
-      ref: native
+      ref: pip-6s
   cached_network_image_ce:
     git:
       url: https://github.com/My-Responsitories/flutter_cached_network_image_ce.git

@@ -20,6 +20,8 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
+import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/media_diag.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
@@ -48,6 +50,7 @@ import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/screen_wake_lock.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
@@ -76,7 +79,6 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:native_device_orientation/native_device_orientation.dart';
 import 'package:path/path.dart' as path;
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 typedef PlayCallback = Future<void>? Function();
@@ -1168,16 +1170,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     _iosPipStartedEvent = false;
     isIOSPip.value = true;
-    if (isLiveContainerMultitask) {
-      // 宿主的窗口托管方式可能影响小窗能否拿到画面。先把话说清楚，再把原生侧的读数
-      // 直接画进小窗画面——否则用户只会看到一个黑窗，无从判断卡在哪一步。
-      SmartDialog.showToast('多任务模式：若小窗无画面，读数会直接显示在小窗里');
-      unawaited(
-        videoController
-            .setPictureInPictureDebugOverlay(true)
-            .catchError((_) {}),
-      );
-    }
+    // 诊断叠加层会把读数连同一条**逐帧右移的纯红色色块**一起画进小窗画面，每帧
+    // 还要多做一次整帧拷贝与一次文字绘制。以前在多任务模式下是无条件打开的，
+    // 结果 15pm 的小窗底部一直有条红光在闪，还白吃掉一帧的带宽（6S 更扛不住）。
+    // 现在一律关掉：要看读数请用抖音播放页的诊断面板（「画字进小窗」开关，
+    // 面板一关就自动收掉）。这里显式下发一次 false，避免同一个控制器复用上一条
+    // 视频留下的状态。
+    unawaited(
+      videoController
+          .setPictureInPictureDebugOverlay(false)
+          .catchError((_) {}),
+    );
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
         isIOSPip.value = false;
@@ -2114,7 +2117,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _stopWakeLock() {
-    WakelockPlus.disable();
+    ScreenWakeLock.release(this);
     _updatePlaybackState(debugLabel: 'onVideoPaused');
   }
 
@@ -2140,7 +2143,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           playerStatus = .playing;
           _stopWakeLockTimer();
           _updatePlaybackState();
-          WakelockPlus.enable();
+          ScreenWakeLock.acquire(this);
           _syncIOSAutoEnterPip();
 
           if (_isAutoEnterPip) {
@@ -2177,6 +2180,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           }
 
           makeHeartBeat(-1, type: .completed);
+          _consumeInjectedNext();
         }
       }),
 
@@ -2367,6 +2371,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     audioSessionHandler?.setActive(true);
 
     playerStatus = .playing;
+  }
+
+  /// B 站收藏播完这一条时，看看「下一首播放」里有没有别的收藏夹排进来的视频。
+  ///
+  /// 以前插队队列只有小视频播放页会取，B 站播放器根本不知道它的存在，
+  /// 所以「播着 B 站，把抖音插到下一首」等于白插。这里接上：
+  /// 有就整批取走，交给小视频播放页接着播 —— 两个收藏夹从此连成一条链。
+  void _consumeInjectedNext() {
+    if (QueueBus.pending == 0) return;
+    final entries = QueueBus.drainAll();
+    if (entries.isEmpty) return;
+    // isInterrupt: 不主动让出音频焦点，交给新页面接手，中间别出现一段静音。
+    unawaited(pause(isInterrupt: true));
+    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
   }
 
   /// 暂停播放
@@ -2826,7 +2844,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _positionListeners.clear();
     _statusListeners.clear();
     _stopWakeLockTimer();
-    WakelockPlus.disable();
+    ScreenWakeLock.release(this);
     if (kDebugMode) {
       debugPrint('dispose player');
     }
