@@ -31,6 +31,8 @@ PipQaVerdict evaluatePipQaLog(
   }
   final backgroundSeconds = config.effectiveBackgroundSeconds.toDouble();
   final needed = math.min(3.0, backgroundSeconds * 0.55);
+  final hostDiagFailure = _evaluateHostDiag(log, config, needed);
+  if (hostDiagFailure != null) return hostDiagFailure;
   final nativeDiag = _evaluateNativeDiag(log, config, needed);
   final nativeBackground = _evaluateNativeBackground(log, typed, config, needed);
   final capability = _sampleDiagnosticsCapability(typed);
@@ -237,6 +239,106 @@ Map<String, Object?> _backgroundSummary(Map<String, dynamic> log) {
     ...summary,
     'sampleSeconds': log['sampleSeconds'],
   };
+}
+
+PipQaVerdict? _evaluateHostDiag(
+  Map<String, dynamic> log,
+  PipQaConfig config,
+  double needed,
+) {
+  final hostDiag = _map(log['hostDiag']);
+  if (hostDiag['available'] != true) {
+    final reason = _text(hostDiag['reason']);
+    return PipQaVerdict(
+      false,
+      '宿主没有记录本轮真实 Home 后台生命周期：'
+      '${reason.isEmpty ? '缺少 pip_qa_host.jsonl 或当前 runId' : reason}',
+    );
+  }
+  final configRunId = config.runId;
+  final hostRunId = _text(hostDiag['runId']);
+  final logRunId = _text(log['runId']);
+  final expectedRunId = configRunId.isNotEmpty ? configRunId : logRunId;
+  if (hostRunId.isEmpty ||
+      (configRunId.isNotEmpty && hostRunId != configRunId) ||
+      (logRunId.isNotEmpty && hostRunId != logRunId)) {
+    return PipQaVerdict(
+      false,
+      '宿主日志 runId 与 QA 配置不一致，旧日志不能作为本轮证据',
+    );
+  }
+  final detail = '后台 ${_num(hostDiag['hostBackgroundSeconds']).toStringAsFixed(1)} 秒、'
+      'suspend 请求 ${hostDiag['suspendRequested'] == true ? '是' : '否'}、'
+      'resume 请求 ${hostDiag['resumeRequested'] == true ? '是' : '否'}、'
+      'resume 执行 ${hostDiag['resumeApplied'] == true ? '是' : '否'}、'
+      '最后宿主状态 ${_text(hostDiag['lastAppState'])}';
+  if (hostDiag['suspendRequested'] != true ||
+      hostDiag['resumeRequested'] != true ||
+      hostDiag['resumeApplied'] != true) {
+    return PipQaVerdict(false, '宿主后台请求链不完整：$detail');
+  }
+  if (_text(hostDiag['lastAppState']) != 'active') {
+    return PipQaVerdict(false, '宿主没有回到前台 active 状态：$detail');
+  }
+  final backgroundEvent = _map(hostDiag['backgroundEvent']);
+  final willEnterForegroundEvent = _map(
+    hostDiag['willEnterForegroundEvent'],
+  );
+  final foregroundEvent = _map(hostDiag['foregroundEvent']);
+  final backgroundSeconds = _num(backgroundEvent['ts']);
+  final willEnterForegroundSeconds = _num(willEnterForegroundEvent['ts']);
+  final foregroundSeconds = _num(foregroundEvent['ts']);
+  if (backgroundEvent['appState'] != 'background' ||
+      backgroundSeconds <= 0 ||
+      _text(backgroundEvent['event']) != 'didEnterBackground') {
+    return PipQaVerdict(
+      false,
+      '宿主片段缺少 didEnterBackground 时标记的 background 状态：$detail',
+    );
+  }
+  if (hostDiag['segmentComplete'] != true) {
+    return PipQaVerdict(
+      false,
+      '宿主没有完整记录 didEnterBackground → willEnterForeground → didBecomeActive 窗口：$detail',
+    );
+  }
+  if (_text(willEnterForegroundEvent['event']) != 'willEnterForeground' ||
+      willEnterForegroundSeconds < backgroundSeconds ||
+      willEnterForegroundSeconds > foregroundSeconds ||
+      _text(foregroundEvent['event']) != 'didBecomeActive' ||
+      foregroundEvent['appState'] != 'active' ||
+      foregroundSeconds < backgroundSeconds) {
+    return PipQaVerdict(
+      false,
+      '宿主回前台事件顺序不完整或时间戳倒挂：$detail',
+    );
+  }
+  final seconds = foregroundSeconds - backgroundSeconds;
+  final recordedSeconds = _num(hostDiag['hostBackgroundSeconds']);
+  if (recordedSeconds != seconds) {
+    return PipQaVerdict(false, '宿主后台秒数与事件时间戳不一致：$detail');
+  }
+  if (seconds < math.max(1.5, needed)) {
+    return PipQaVerdict(
+      false,
+      '宿主真实后台只有 ${seconds.toStringAsFixed(1)} 秒，少于 '
+      '${math.max(1.5, needed).toStringAsFixed(1)} 秒：$detail',
+    );
+  }
+  final hostEvents = hostDiag['events'];
+  if (hostEvents is! List || hostEvents.isEmpty) {
+    return PipQaVerdict(false, '宿主生命周期事件缺失：$detail');
+  }
+  if (expectedRunId.isNotEmpty &&
+      hostEvents.any(
+        (event) => _text(_map(event)['runId']) != expectedRunId,
+      )) {
+    return PipQaVerdict(
+      false,
+      '宿主日志混入了其它 runId 的事件，本轮证据无效：$detail',
+    );
+  }
+  return null;
 }
 
 PipQaVerdict? _evaluateNativeDiag(
@@ -557,9 +659,12 @@ bool _isPipVisibleInBackground(Map<String, Object?> diagnostics) {
 bool _isBackgroundDiagnostics(Map<String, Object?> diagnostics) {
   final appState = _text(diagnostics['appState']);
   final bgSeconds = _num(diagnostics['bgSeconds']);
-  return appState == 'background' ||
-      appState == 'inactive' ||
-      (appState.isEmpty && bgSeconds >= 0);
+  if (appState != 'background' && appState != 'inactive') return false;
+  return bgSeconds > 0 ||
+      (diagnostics['showing'] == true &&
+          diagnostics['hostAttached'] == true &&
+          diagnostics['layerDetached'] == true &&
+          _text(diagnostics['layerOwner']) == 'system');
 }
 
 bool _isPipVisible(Map<String, Object?> diagnostics) {

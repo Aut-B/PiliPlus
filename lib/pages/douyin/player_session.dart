@@ -42,9 +42,12 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   bool _initialized = false;
   bool _disposed = false;
+  bool _disposeRequested = false;
   bool _audioActive = false;
   bool _wakeLockHeld = false;
   bool _observing = false;
+  bool _iosPipHold = false;
+  bool _iosPipRestoring = false;
   Timer? _wakeLockReleaseTimer;
   Future<void>? _ensureReadyFuture;
   bool pipActive = false;
@@ -62,7 +65,9 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   Object? _autoPipArmedFor;
   bool? _autoPipArmedValue;
   Object? _pipQaModeFor;
+  String? _pipQaMode;
   String? _pipQaRunId;
+  bool _foregroundPipStartInFlight = false;
   DateTime? _backgroundAt;
   Map<String, Object?>? _backgroundStart;
 
@@ -79,6 +84,8 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   );
 
   bool get ready => !_disposed && player != null && controller != null;
+  bool get pipHold => _iosPipHold;
+  String get pipQaMode => PipQaConfig.active?.pipMode ?? 'legacy';
 
   Future<void> ensureReady() {
     if (_disposed) return Future<void>.value();
@@ -95,6 +102,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   Future<void> _createSession() async {
     if (_disposed) return;
     if (_initialized && ready) return;
+    _disposeRequested = false;
     Player? createdPlayer;
     VideoController? createdController;
     try {
@@ -166,14 +174,20 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
         switch (event) {
           case 'start':
             pipActive = true;
+            _foregroundPipStartInFlight = false;
+            _acquirePipHold();
             unawaited(_setAudioSession(true));
             unawaited(forceOverlayOff());
           case 'restore':
             pipActive = false;
+            _foregroundPipStartInFlight = false;
+            _iosPipRestoring = true;
             unawaited(_restorePage());
           case 'stop':
             pipActive = false;
-            unawaited(armPip());
+            _foregroundPipStartInFlight = false;
+            _releasePipHold();
+            unawaited(armPip(force: true));
         }
         _recordLifecycle(event);
         _notify(_pipEvents, event);
@@ -181,7 +195,9 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
       });
       _pipErrorSub = PictureInPicture.errors.listen((message) {
         pipActive = false;
-        unawaited(armPip());
+        _foregroundPipStartInFlight = false;
+        _releasePipHold();
+        unawaited(armPip(force: true));
         _recordLifecycle('error');
         _notify(_pipErrors, message);
         _refreshUi();
@@ -215,7 +231,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     }
     _wakeLockReleaseTimer = Timer(const Duration(milliseconds: 600), () {
       _wakeLockReleaseTimer = null;
-      _releaseWakeLockNow();
+      if (!playing) _releaseWakeLockNow();
     });
   }
 
@@ -228,24 +244,26 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     }
   }
 
-  Future<void> armPip() async {
+  Future<void> armPip({bool force = false}) async {
     if (!Platform.isIOS || !ready) return;
     final current = controller!;
     final qaConfig = PipQaConfig.active;
-    if (qaConfig != null &&
-        (!identical(_pipQaModeFor, current) ||
-            _pipQaRunId != qaConfig.runId)) {
+    final mode = pipQaMode;
+    final runId = qaConfig?.runId ?? '';
+    if (!identical(_pipQaModeFor, current) ||
+        _pipQaMode != mode ||
+        _pipQaRunId != runId) {
       try {
-        await current.setPictureInPictureQaMode(
-          'legacy',
-          runId: qaConfig.runId,
-        );
+        final dynamic qaController = current;
+        await qaController.setPictureInPictureQaMode(mode, runId: runId);
         _pipQaModeFor = current;
-        _pipQaRunId = qaConfig.runId;
+        _pipQaMode = mode;
+        _pipQaRunId = runId;
       } catch (_) {}
     }
-    final armedValue = autoPiP;
-    if (identical(_autoPipArmedFor, current) &&
+    final armedValue = PipQaConfig.active != null || autoPiP;
+    if (!force &&
+        identical(_autoPipArmedFor, current) &&
         _autoPipArmedValue == armedValue) {
       return;
     }
@@ -292,31 +310,77 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   Future<void> startPip() async {
     if (!Platform.isIOS || !ready) return;
-    final current = controller!;
-    if (!await current.isPictureInPictureSupported()) {
-      pipSupported = false;
-      _refreshUi();
-      throw StateError('系统说这台机器现在不能画中画');
-    }
-    pipSupported = true;
-    await forceOverlayOff();
-    await _setAudioSession(true);
-    await armPip();
-    await current.setPictureInPicture(true);
-    pipActive = true;
-    _recordLifecycle('manual-start');
-    _refreshUi();
+    await _startPipFromForegroundBiliLike(manual: true);
   }
 
   Future<void> stopPip() async {
     pipActive = false;
+    _foregroundPipStartInFlight = false;
+    _releasePipHold();
     if (Platform.isIOS && ready) {
       try {
         await controller!.setPictureInPicture(false);
       } catch (_) {}
-      await armPip();
+      await armPip(force: true);
     }
     _recordLifecycle('manual-stop');
+    _refreshUi();
+  }
+
+  void _acquirePipHold() {
+    _iosPipHold = true;
+  }
+
+  void _releasePipHold() {
+    if (!_iosPipHold) return;
+    if (_iosPipRestoring) {
+      _iosPipRestoring = false;
+      _schedulePipHoldReleaseAfterRestore(0);
+      return;
+    }
+    _finishPipHoldRelease();
+  }
+
+  void _schedulePipHoldReleaseAfterRestore(int attempt) {
+    Future<void>.delayed(const Duration(milliseconds: 250), () {
+      if (!_iosPipHold || _disposed) return;
+      if (Get.currentRoute == ShortVideoPlayerRoute.routeName ||
+          attempt >= 24) {
+        _finishPipHoldRelease();
+        return;
+      }
+      _schedulePipHoldReleaseAfterRestore(attempt + 1);
+    });
+  }
+
+  void _finishPipHoldRelease() {
+    _iosPipHold = false;
+    _foregroundPipStartInFlight = false;
+    if (_disposeRequested) unawaited(disposeSession());
+  }
+
+  Future<void> _startPipFromForegroundBiliLike({bool manual = false}) async {
+    if (!Platform.isIOS || !ready || !playing || _disposed) return;
+    if (pipActive || _foregroundPipStartInFlight) return;
+    _foregroundPipStartInFlight = true;
+    final current = controller!;
+    unawaited(Future<void>.delayed(const Duration(seconds: 2), () {
+      if (_foregroundPipStartInFlight && !pipActive) {
+        _foregroundPipStartInFlight = false;
+      }
+    }));
+    _acquirePipHold();
+    pipSupported = true;
+    pipActive = true;
+    _recordLifecycle(manual ? 'manual-start' : 'inactive-start');
+    unawaited(forceOverlayOff().catchError((_) {}));
+    unawaited(_forcePipDanmakuOff(current).catchError((_) {}));
+    unawaited(_setAudioSession(true));
+    unawaited(current.setPictureInPicture(true).catchError((_) {
+      pipActive = false;
+      _releasePipHold();
+    }));
+    unawaited(armPip());
     _refreshUi();
   }
 
@@ -341,23 +405,27 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     appState = state.name;
     _recordLifecycle('app-${state.name}');
     if (state == AppLifecycleState.inactive) {
-      unawaited(_preparePipTransition(forceAudio: true));
+      if (playing) _setWakeLock(true);
+      _startBackgroundWindow();
       return;
     }
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       _releaseWakeLockNow();
-      if (_backgroundAt == null) {
-        _backgroundAt = DateTime.now();
-        unawaited(_beginBackgroundSample());
-      }
-      unawaited(_preparePipTransition(forceAudio: true));
+      _startBackgroundWindow();
       return;
     }
     if (state == AppLifecycleState.resumed) {
       if (playing) _setWakeLock(true);
+      _foregroundPipStartInFlight = false;
       unawaited(_endBackgroundSample());
       unawaited(_onResumed());
     }
+  }
+
+  void _startBackgroundWindow() {
+    if (_backgroundAt != null) return;
+    _backgroundAt = DateTime.now();
+    unawaited(_beginBackgroundSample());
   }
 
   Future<void> _beginBackgroundSample() async {
@@ -400,7 +468,11 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   double _numeric(Object? value) => value is num ? value.toDouble() : 0;
 
   Future<void> _onResumed() async {
-    await _preparePipTransition(forceAudio: true);
+    await _setAudioSession(true);
+    if (Get.currentRoute == ShortVideoPlayerRoute.routeName) {
+      _iosPipRestoring = false;
+      _finishPipHoldRelease();
+    }
     _refreshUi();
   }
 
@@ -467,7 +539,12 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   Future<void> disposeSession() async {
     if (_disposed) return;
+    if (_iosPipHold) {
+      _disposeRequested = true;
+      return;
+    }
     _disposed = true;
+    _disposeRequested = false;
     if (_observing) {
       WidgetsBinding.instance.removeObserver(this);
       _observing = false;

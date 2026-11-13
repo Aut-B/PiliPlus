@@ -14,6 +14,10 @@ typedef PipQaNativeDiagLoader = Future<Map<String, Object?>> Function({
   PipQaConfig? config,
   DateTime? updatedAt,
 });
+typedef PipQaHostDiagLoader = Future<Map<String, Object?>> Function({
+  PipQaConfig? config,
+  DateTime? updatedAt,
+});
 
 Future<void> _pipQaWriteQueue = Future<void>.value();
 int _pipQaWriteSequence = 0;
@@ -45,6 +49,7 @@ final class PipQaRecorder {
     this.state, {
     required this.index,
     this.loadNativeDiag,
+    this.loadHostDiag,
   });
 
   final PipQaConfig config;
@@ -52,6 +57,7 @@ final class PipQaRecorder {
   final int index;
   final PipQaStateBuilder state;
   final PipQaNativeDiagLoader? loadNativeDiag;
+  final PipQaHostDiagLoader? loadHostDiag;
   Timer? _timer;
   bool _closed = false;
   final List<Map<String, Object?>> _samples = <Map<String, Object?>>[];
@@ -60,6 +66,7 @@ final class PipQaRecorder {
   Map<String, Object?> _backgroundSummary = const <String, Object?>{};
   Map<String, Object?> _finalSnapshot = const <String, Object?>{};
   Map<String, Object?> _nativeDiag = const <String, Object?>{};
+  Map<String, Object?> _hostDiag = const <String, Object?>{};
   String _lastVerdict = '自动 QA 正在采样，等待切后台与回前台';
   bool _pass = false;
   double get _sampleSeconds {
@@ -135,6 +142,10 @@ final class PipQaRecorder {
       config: config,
       updatedAt: DateTime.now(),
     );
+    final hostDiag = await readPipQaHostDiag(
+      config: config,
+      updatedAt: DateTime.now(),
+    );
     await _writePipQaLog(
       <String, Object?>{
         'runId': config.runId,
@@ -146,6 +157,7 @@ final class PipQaRecorder {
         'backgroundSeconds': 0,
         'backgroundSummary': const <String, Object?>{},
         'nativeDiag': nativeDiag,
+        'hostDiag': hostDiag,
         'finalSnapshot': const <String, Object?>{},
       },
       finalWrite: true,
@@ -165,6 +177,7 @@ final class PipQaRecorder {
     _backgroundSeconds = backgroundSeconds;
     _backgroundSummary = Map<String, Object?>.of(backgroundSummary);
     _nativeDiag = await _safeNativeDiag();
+    _hostDiag = await _safeHostDiag();
     final snapshot = <String, Object?>{
       ..._lastSnapshot,
       'backgroundSeconds': _backgroundSeconds,
@@ -182,6 +195,7 @@ final class PipQaRecorder {
         'backgroundSeconds': _backgroundSeconds,
         'backgroundSummary': _backgroundSummary,
         'nativeDiag': _nativeDiag,
+        'hostDiag': _hostDiag,
         'finalSnapshot': _finalSnapshot,
       }, finalWrite: true);
     }
@@ -194,6 +208,7 @@ final class PipQaRecorder {
       'backgroundSummary': _backgroundSummary,
       'sampleSeconds': _sampleSeconds,
       'nativeDiag': _nativeDiag,
+      'hostDiag': _hostDiag,
       'samples': List<Map<String, Object?>>.of(_samples),
       'finalSnapshot': _finalSnapshot,
     };
@@ -203,6 +218,7 @@ final class PipQaRecorder {
     _pass = verdict.pass;
     _lastVerdict = verdict.verdict;
     _nativeDiag = await _safeNativeDiag();
+    _hostDiag = await _safeHostDiag();
     await _write(<String, Object?>{
       'runId': config.runId,
       'updatedAt': DateTime.now().toIso8601String(),
@@ -213,6 +229,7 @@ final class PipQaRecorder {
       'backgroundSeconds': _backgroundSeconds,
       'backgroundSummary': _backgroundSummary,
       'nativeDiag': _nativeDiag,
+      'hostDiag': _hostDiag,
       'finalSnapshot': _finalSnapshot,
     }, finalWrite: true);
   }
@@ -226,6 +243,7 @@ final class PipQaRecorder {
 
   Future<void> _fail(String verdict) async {
     _nativeDiag = await _safeNativeDiag();
+    _hostDiag = await _safeHostDiag();
     await _write(<String, Object?>{
       'runId': config.runId,
       'updatedAt': DateTime.now().toIso8601String(),
@@ -236,6 +254,7 @@ final class PipQaRecorder {
       'backgroundSeconds': _backgroundSeconds,
       'backgroundSummary': _backgroundSummary,
       'nativeDiag': _nativeDiag,
+      'hostDiag': _hostDiag,
       'finalSnapshot': _finalSnapshot,
     }, finalWrite: true);
   }
@@ -243,6 +262,15 @@ final class PipQaRecorder {
   Future<Map<String, Object?>> _safeNativeDiag() async {
     try {
       final loader = loadNativeDiag ?? readPipQaNativeDiag;
+      return await loader(config: config, updatedAt: DateTime.now());
+    } catch (_) {
+      return const <String, Object?>{};
+    }
+  }
+
+  Future<Map<String, Object?>> _safeHostDiag() async {
+    try {
+      final loader = loadHostDiag ?? readPipQaHostDiag;
       return await loader(config: config, updatedAt: DateTime.now());
     } catch (_) {
       return const <String, Object?>{};
@@ -365,6 +393,218 @@ Future<Map<String, Object?>> readPipQaNativeDiag({
       'reason': '原生诊断文件读取失败',
     };
   }
+}
+
+Future<Map<String, Object?>> readPipQaHostDiag({
+  PipQaConfig? config,
+  DateTime? updatedAt,
+}) async {
+  if (!Platform.isIOS) {
+    return const <String, Object?>{'available': false};
+  }
+  final runId = config?.runId ?? '';
+  if (runId.isEmpty) {
+    return const <String, Object?>{
+      'available': false,
+      'reason': '当前构建缺少本轮 QA runId，不能使用任意历史宿主日志',
+    };
+  }
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/${PipQaConfig.hostDiagFileName}');
+    if (!await file.exists()) {
+      return const <String, Object?>{
+        'available': false,
+        'reason': '当前构建没有写入 pip_qa_host.jsonl；需含宿主生命周期记录的新构建',
+      };
+    }
+    final maxAge = config == null
+        ? 300.0
+        : config.effectivePlaySeconds +
+            config.effectiveBackgroundSeconds +
+            config.effectiveAdvanceEvery * 2 +
+            90.0;
+    final minSeconds = updatedAt == null
+        ? -1.0
+        : updatedAt.millisecondsSinceEpoch / 1000.0 - maxAge;
+    final events = <Map<String, Object?>>[];
+    final lines = await file
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .toList();
+    final start = lines.length > 240 ? lines.length - 240 : 0;
+    for (var index = start; index < lines.length; index += 1) {
+      final line = lines[index].trim();
+      if (line.isEmpty) continue;
+      try {
+        final decoded = jsonDecode(line);
+        if (decoded is! Map) continue;
+        final event = <String, Object?>{};
+        decoded.forEach((key, value) => event['$key'] = value);
+        if ('${event['runId'] ?? ''}' != runId) continue;
+        final ts = _num(event['ts']);
+        if (ts <= 0 || (minSeconds >= 0 && ts < minSeconds)) continue;
+        events.add(event);
+      } catch (_) {}
+    }
+    if (events.isEmpty) {
+      return <String, Object?>{
+        'available': false,
+        'reason': '没有找到当前 runId 且在本轮时间窗内的宿主生命周期事件',
+        'events': const <Object>[],
+      };
+    }
+    final segment = _hostDiagSegment(events);
+    return <String, Object?>{
+      'available': true,
+      'runId': runId,
+      'lineCount': events.length,
+      ...segment,
+      'lastAppState': _hostDiagLastAppState(events),
+      'events': events,
+    };
+  } catch (_) {
+    return const <String, Object?>{
+      'available': false,
+      'reason': '宿主生命周期文件读取失败',
+    };
+  }
+}
+
+Map<String, Object?> _hostDiagSegment(List<Map<String, Object?>> events) {
+  const absent = <String, Object?>{};
+  final incomplete = <String, Object?>{
+    'segmentComplete': false,
+    'hostBackgroundSeconds': -1.0,
+    'backgroundEvent': absent,
+    'willEnterForegroundEvent': absent,
+    'foregroundEvent': absent,
+    'suspendRequested': events.any(
+      (event) => _text(event['event']) == 'suspendRequested',
+    ),
+    'resumeRequested': events.any(
+      (event) => _text(event['event']) == 'resumeRequested',
+    ),
+    'resumeApplied': events.any(
+      (event) => _text(event['event']) == 'resumeApplied',
+    ),
+  };
+  var foregroundIndex = -1;
+  for (var index = events.length - 1; index >= 0; index -= 1) {
+    if (_text(events[index]['event']) == 'didBecomeActive') {
+      foregroundIndex = index;
+      break;
+    }
+  }
+  var backgroundIndex = -1;
+  for (var index = foregroundIndex - 1; index >= 0; index -= 1) {
+    final event = _text(events[index]['event']);
+    if (event == 'didEnterBackground') {
+      backgroundIndex = index;
+      break;
+    }
+    if (event == 'didBecomeActive') break;
+  }
+  if (backgroundIndex < 0 || foregroundIndex < 0) {
+    return incomplete;
+  }
+  final segmentEvents = events.sublist(backgroundIndex, foregroundIndex + 1);
+  final backgroundSeconds = _num(segmentEvents.first['ts']);
+  final foregroundSeconds = _num(segmentEvents.last['ts']);
+  final backgroundEvent = segmentEvents.first;
+  final foregroundEvent = segmentEvents.last;
+  if (_text(backgroundEvent['event']) != 'didEnterBackground' ||
+      _text(backgroundEvent['appState']) != 'background' ||
+      _text(foregroundEvent['event']) != 'didBecomeActive' ||
+      _text(foregroundEvent['appState']) != 'active' ||
+      backgroundSeconds <= 0 ||
+      foregroundSeconds < backgroundSeconds) {
+    return incomplete;
+  }
+  final willEnterForegroundEvent = _hostDiagEvent(
+    events,
+    'willEnterForeground',
+    minSeconds: backgroundSeconds,
+    maxSeconds: foregroundSeconds,
+  );
+  final suspendEvent = _hostDiagEvent(
+    events,
+    'suspendRequested',
+    minSeconds: backgroundSeconds - 5,
+    maxSeconds: backgroundSeconds + 5,
+  );
+  final resumeEvent = _hostDiagEvent(
+    events,
+    'resumeRequested',
+    minSeconds: backgroundSeconds,
+    maxSeconds: foregroundSeconds + 5,
+  );
+  final resumeAppliedEvent = _hostDiagEvent(
+    events,
+    'resumeApplied',
+    minSeconds: backgroundSeconds,
+    maxSeconds: foregroundSeconds + 5,
+  );
+  final complete = backgroundEvent.isNotEmpty &&
+      willEnterForegroundEvent.isNotEmpty &&
+      suspendEvent.isNotEmpty &&
+      resumeEvent.isNotEmpty &&
+      resumeAppliedEvent.isNotEmpty &&
+      _num(willEnterForegroundEvent['ts']) >= backgroundSeconds &&
+      _num(willEnterForegroundEvent['ts']) <= foregroundSeconds &&
+      _num(suspendEvent['ts']) >= backgroundSeconds - 5 &&
+      _num(suspendEvent['ts']) <= backgroundSeconds + 5 &&
+      _num(resumeEvent['ts']) >= backgroundSeconds &&
+      _num(resumeEvent['ts']) <= foregroundSeconds + 5 &&
+      _num(resumeAppliedEvent['ts']) >= backgroundSeconds &&
+      _num(resumeAppliedEvent['ts']) <= foregroundSeconds + 5;
+  return <String, Object?>{
+    'segmentComplete': complete,
+    'hostBackgroundSeconds': complete
+        ? foregroundSeconds - backgroundSeconds
+        : -1.0,
+    'backgroundEvent': backgroundEvent,
+    'willEnterForegroundEvent': willEnterForegroundEvent,
+    'foregroundEvent': foregroundEvent,
+    'suspendRequested': suspendEvent.isNotEmpty,
+    'resumeRequested': resumeEvent.isNotEmpty,
+    'resumeApplied': resumeAppliedEvent.isNotEmpty,
+    'resumeAppliedEvent': resumeAppliedEvent,
+  };
+}
+
+Map<String, Object?> _hostDiagEvent(
+  List<Map<String, Object?>> events,
+  String name, {
+  required double minSeconds,
+  required double maxSeconds,
+}) {
+  for (final event in events) {
+    if (_text(event['event']) != name) continue;
+    final seconds = _num(event['ts']);
+    if (seconds >= minSeconds && seconds <= maxSeconds) return event;
+  }
+  return const <String, Object?>{};
+}
+
+/// QA 通道事件只是内部控制标记：resumeApplied 记的是执行 resume 那一刻的
+/// 真实 applicationState，不能拿它覆盖 didBecomeActive 的最终生命周期状态。
+String _hostDiagLastAppState(List<Map<String, Object?>> events) {
+  const lifecycleEvents = <String>{
+    'started',
+    'willResignActive',
+    'didEnterBackground',
+    'willEnterForeground',
+    'didBecomeActive',
+  };
+  for (var index = events.length - 1; index >= 0; index -= 1) {
+    final event = events[index];
+    if (lifecycleEvents.contains(_text(event['event']))) {
+      return _text(event['appState']);
+    }
+  }
+  return '';
 }
 
 Map<String, Object?> _nativeDiagSegment(

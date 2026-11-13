@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// 屏幕常亮的引用计数。
@@ -14,12 +16,20 @@ abstract final class ScreenWakeLock {
   /// 登记一个持有者。重复调用是幂等的。
   static void acquire(Object owner) {
     if (!_owners.add(owner)) return;
-    WakelockPlus.enable();
+    unawaited(
+      WakelockPlus.enable().catchError((Object _) => Future<void>.value()),
+    );
   }
 
   /// 注销一个持有者。只有全部注销之后才真正放开常亮。
   static void release(Object owner) {
     if (!_owners.remove(owner)) return;
-    if (_owners.isEmpty) WakelockPlus.disable();
+    if (_owners.isEmpty) {
+      unawaited(
+        WakelockPlus.disable().catchError(
+          (Object _) => Future<void>.value(),
+        ),
+      );
+    }
   }
 }

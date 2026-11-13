@@ -144,7 +144,10 @@ Future<void> _drivePipQaLifecycle(PipQaConfig config) async {
   try {
     await const MethodChannel('PiliPlus/PipQa').invokeMethod<void>(
       'background',
-      <String, Object?>{'seconds': config.effectiveBackgroundSeconds},
+      <String, Object?>{
+        'seconds': config.effectiveBackgroundSeconds,
+        'runId': config.runId,
+      },
     );
   } catch (error) {
     final verdict = '无法让真机宿主切到后台：$error；自动 QA 无法采样后台小窗';

@@ -13,6 +13,7 @@ class PipQaConfig {
     required this.backgroundSeconds,
     this.advanceEvery = 0,
     this.autoStart = true,
+    this.pipMode = 'legacy',
     this.seedKeys = const <String>[],
   });
 
@@ -25,6 +26,7 @@ class PipQaConfig {
         (json['backgroundSeconds'] as num?)?.toInt() ?? 10,
     advanceEvery: (json['advanceEvery'] as num?)?.toInt() ?? 0,
     autoStart: json['autoStart'] != false,
+    pipMode: _normalizePipMode(json['pipMode']),
     seedKeys:
         (json['seedKeys'] as List?)
             ?.map((value) => '$value')
@@ -39,19 +41,28 @@ class PipQaConfig {
   final int backgroundSeconds;
   final int advanceEvery;
   final bool autoStart;
+  final String pipMode;
   final List<String> seedKeys;
+
+  static String _normalizePipMode(Object? value) {
+    final mode = '$value';
+    return const <String>{'legacy', 'system', 'manual', 'bili'}.contains(mode)
+        ? mode
+        : 'legacy';
+  }
 
   /// 把外部配置收敛到安全范围，保证采样、后台、判定和收尾用同一组秒数。
   int get effectivePlaySeconds => playSeconds.clamp(2, 120);
   int get effectiveBackgroundSeconds => backgroundSeconds.clamp(2, 60);
   int get effectiveAdvanceEvery => advanceEvery.clamp(0, 30);
 
-  /// 当前进程正在执行的 QA 配置；只用于被动记录，不改变画中画控制流。
+  /// 当前进程正在执行的 QA 配置；会驱动自动 QA 启动、原生 QA 模式与判定收尾。
   static PipQaConfig? active;
 
   static const String fileName = 'pip_qa.json';
   static const String logFileName = 'pip_qa_log.json';
   static const String nativeDiagFileName = 'pip_diag.jsonl';
+  static const String hostDiagFileName = 'pip_qa_host.jsonl';
 }
 
 /// 播放器首条视频真正开始采样后，才允许宿主驱动 Home / 回前台。
