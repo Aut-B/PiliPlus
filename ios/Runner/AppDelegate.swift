@@ -260,7 +260,7 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
       appState: .inactive,
       synchronous: true
     )
-    let applyResume: @escaping () -> Void = { [weak self] in
+    let applyResume: () -> Void = { [weak self] in
       guard let self = self else { return }
       self.lock.lock()
       if self.resumeApplied {
@@ -279,10 +279,10 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
         UIApplication.shared.endBackgroundTask(task)
       }
     }
-    let scheduleResume: @escaping () -> Void = {
+    let scheduleResume: () -> Void = {
       CFRunLoopPerformBlock(
         CFRunLoopGetMain(),
-        kCFRunLoopCommonModes,
+        kCFRunLoopCommonModes as CFTypeRef,
         applyResume
       )
       CFRunLoopWakeUp(CFRunLoopGetMain())
