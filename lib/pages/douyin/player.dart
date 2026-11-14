@@ -525,6 +525,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       backgroundColor: const Color(0xFF1C1C1E),
       builder: (_) => _PipDiagnosticsSheet(
         controller: _session.controller!,
+        fgPipStarts: _session.foregroundPipStarts,
+        foregroundStartRequired:
+            (PipQaConfig.active?.requiresForegroundPipStart ??
+                (_session.pipQaMode == 'manual')),
+        modeLabel: PipQaConfig.active?.foregroundPipStartLabel ?? '手动模式',
       ),
     );
   }
@@ -1905,12 +1910,20 @@ class _PipDiagnosticsSheet extends StatefulWidget {
   const _PipDiagnosticsSheet({
     required this.controller,
     this.fgPipStarts = 0,
+    this.foregroundStartRequired = false,
+    this.modeLabel = '手动模式',
   });
 
   final VideoController controller;
 
   /// 切后台前「前台主动开小窗」的次数，0 表示这次还是走了系统自动进入。
   final int fgPipStarts;
+
+  /// 前台启动模式只要求切后台前已有启动证据，不要求后台再次启动。
+  final bool foregroundStartRequired;
+
+  /// 结论里使用的模式名。
+  final String modeLabel;
 
   @override
   State<_PipDiagnosticsSheet> createState() => _PipDiagnosticsSheetState();
@@ -2020,25 +2033,14 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
     final bgSeconds = _num(_data['bgSeconds']);
     if (bgSeconds >= 1.5) {
       final secs = bgSeconds.toStringAsFixed(1);
-      if (widget.fgPipStarts < 1) {
-        return '上次后台 $secs 秒：小窗是系统自动弹的（前台启动 0 次）'
-            ' —— 6S 上这条路拿到的是死图层';
-      }
       final enq = _num(_data['bgEnqueuedDelta']);
       final same = _num(_data['bgSameFrameDelta']);
       final moved = _num(_data['bgPositionDelta']);
-      final starts = _num(_data['bgStartCallsDelta']);
-      final didStart = _num(_data['bgDidStartDelta']);
       final nudges = _num(_data['stallNudge']);
       final rebuilds = _num(_data['controllerRebuild']);
       final detached = _data['layerDetached'] == true;
-      if (widget.fgPipStarts > 0 && starts < 1) {
-        return '上次后台 $secs 秒：前台进小窗 ${widget.fgPipStarts} 次，后台启动调用 0'
-            ' —— 主队列被后台冻死，重试没跑起来';
-      }
-      if (starts > 0 && didStart < 1) {
-        return '上次后台 $secs 秒：发起 ${starts.round()} 次小窗，didStart 一次没来'
-            '（图层被接管：${detached ? '是' : '否'}）';
+      if (widget.foregroundStartRequired && widget.fgPipStarts < 1) {
+        return '上次后台 $secs 秒：${widget.modeLabel}没有记录到前台启动';
       }
       if (enq < 2) {
         return '上次后台 $secs 秒：一帧都没进图层（+${enq.round()}）';
@@ -2050,11 +2052,18 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         return '上次后台 $secs 秒：帧在送（+${enq.round()}）但进度不走 —— 卡在解码'
             '${nudges > 0 ? '（看门狗已重推 ${nudges.round()} 次）' : ''}';
       }
-      // 叠加层开着时「同帧」几乎恒为 0（每帧都重画读数），这一项此时不可信；
-      // 判断卡帧只剩两条依据：进度在不在走、图层有没有被系统收进小窗。
-      return '上次后台 $secs 秒：入队 +${enq.round()}、内容在变、进度 +${moved.toStringAsFixed(1)} 秒'
-          ' —— 卡在图层/小窗那一环'
-          '（图层被接管：${detached ? '是' : '否'}，重建 ${rebuilds.round()} 次）';
+      if (rebuilds > 0) {
+        return '上次后台 $secs 秒：小窗图层重建 ${rebuilds.round()} 次'
+            '（图层被接管：${detached ? '是' : '否'}）';
+      }
+      if (_data['layerOwner'] != 'system' || !detached) {
+        return '上次后台 $secs 秒：内容在变、进度 +${moved.toStringAsFixed(1)} 秒'
+            ' —— 卡在图层/小窗那一环'
+            '（图层归属 ${_text(_data['layerOwner'])}，被接管：'
+            '${detached ? '是' : '否'}）';
+      }
+      return '上次后台 $secs 秒：系统小窗持续出帧 —— 入队 +${enq.round()}、'
+          '内容在变、进度 +${moved.toStringAsFixed(1)} 秒、图层已接管';
     }
     // 小窗正在显示时（前台也能读到）：先看「同一帧被反复重推」「显示中清屏」
     // 这两项 —— 它们就是肉眼看到的闪。原先只统计后台窗口期，前台小窗里闪的
@@ -2088,24 +2097,32 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
     if (_data.isEmpty) return Colors.orangeAccent;
     final bgSeconds = _num(_data['bgSeconds']);
     if (bgSeconds >= 1.5) {
-      final enq = _num(_data['bgEnqueuedDelta']);
-      final same = _num(_data['bgSameFrameDelta']);
-      final moved = _num(_data['bgPositionDelta']);
-      final starts = _num(_data['bgStartCallsDelta']);
-      final didStart = _num(_data['bgDidStartDelta']);
-      final rebuilds = _num(_data['controllerRebuild']);
-      final bad = enq < 2 ||
-          same >= enq * 0.8 ||
-          moved < bgSeconds * 0.3 ||
-          rebuilds > 0 ||
-          (starts > 0 && didStart < 1);
-      return bad ? Colors.redAccent : Colors.orangeAccent;
+      return _backgroundHealthy ? Colors.lightGreenAccent : Colors.redAccent;
     }
     if (_data['showing'] != true) return Colors.orangeAccent;
     if (_noFrameSeconds >= 1.5 || _sourceStoppedSeconds >= 1.5) {
       return Colors.redAccent;
     }
     return Colors.lightGreenAccent;
+  }
+
+  bool get _backgroundHealthy {
+    final bgSeconds = _num(_data['bgSeconds']);
+    final enq = _num(_data['bgEnqueuedDelta']);
+    final same = _num(_data['bgSameFrameDelta']);
+    final moved = _num(_data['bgPositionDelta']);
+    final rebuilds = _num(_data['controllerRebuild']);
+    final detached = _data['layerDetached'] == true;
+    final owner = _text(_data['layerOwner']);
+    return enq >= 2 &&
+        same < enq * 0.8 &&
+        moved >= bgSeconds * 0.3 &&
+        rebuilds <= 0 &&
+        detached &&
+        owner == 'system' &&
+        _data['paused'] != true &&
+        _num(_data['timebaseRate']) >= 0 &&
+        (!widget.foregroundStartRequired || widget.fgPipStarts > 0);
   }
 
   List<List<String>> get _rows => [

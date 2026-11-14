@@ -31,16 +31,46 @@ PipQaVerdict evaluatePipQaLog(
   }
   final backgroundSeconds = config.effectiveBackgroundSeconds.toDouble();
   final needed = math.min(3.0, backgroundSeconds * 0.55);
+  if (config.requiresForegroundPipStart &&
+      !_hasForegroundPipStartEvidence(log, config, typed)) {
+    return PipQaVerdict(
+      false,
+      '${config.foregroundPipStartLabel}没有记录到前台启动证据：'
+      '小窗启动命令未下发，或当前构建没有写入 manualStartEvidence / 后台起点快照',
+    );
+  }
   final hostDiagFailure = _evaluateHostDiag(log, config, needed);
   if (hostDiagFailure != null) return hostDiagFailure;
-  final nativeDiag = _evaluateNativeDiag(log, config, needed);
-  final nativeBackground = _evaluateNativeBackground(log, typed, config, needed);
+  final nativeDiag = _evaluateNativeDiag(
+    log,
+    config,
+    needed,
+  );
+  final nativeBackground = _evaluateNativeBackground(
+    log,
+    typed,
+    config,
+    needed,
+  );
   final capability = _sampleDiagnosticsCapability(typed);
   if (capability != null) return capability;
+  final hostBackgroundSeconds = _num(
+    _map(log['hostDiag'])['hostBackgroundSeconds'],
+  );
   final backgroundSamples = typed.where((sample) {
     final diagnostics = _map(sample['diagnostics']);
     return _isBackgroundDiagnostics(diagnostics);
   }).toList(growable: false);
+  if (hostBackgroundSeconds >= math.max(1.5, needed) &&
+      backgroundSamples.isEmpty) {
+    return PipQaVerdict(
+      false,
+      '宿主已真实后台 ${hostBackgroundSeconds.toStringAsFixed(1)} 秒，'
+          '原生 PiP 却没有把任何采样标记为后台：'
+          'didEnterBackground 通知 / 自动建窗链路未生效，'
+          '前台出帧不能代替系统小窗',
+    );
+  }
   final showing = backgroundSamples.where((sample) {
     final diagnostics = _map(sample['diagnostics']);
     return _isPipVisibleInBackground(diagnostics);
@@ -54,6 +84,19 @@ PipQaVerdict evaluatePipQaLog(
     final fallback = _evaluateAnyWindow(typed, needed);
     if (fallback != null) return fallback;
     if (nativeBackground != null) return nativeBackground;
+    if (hostBackgroundSeconds >= math.max(1.5, needed)) {
+      final diagnostics = _map(typed.last['diagnostics']);
+      final appState = _text(diagnostics['appState']);
+      final owner = _text(diagnostics['layerOwner']);
+      final showingState = diagnostics['showing'] == true ? '是' : '否';
+      return PipQaVerdict(
+        false,
+        '宿主已真实后台 ${hostBackgroundSeconds.toStringAsFixed(1)} 秒，'
+            '但原生读数仍是 App 状态 $appState、小窗显示 $showingState、'
+            '图层归属 $owner：系统没有接管画面源，'
+            '需要修原生建窗 / 图层接管，不是 Dart 播放列表问题',
+      );
+    }
     return const PipQaVerdict(
       false,
       '后台期间没有采样到小窗显示或系统接管图层；小窗未显示或未进入后台',
@@ -72,7 +115,6 @@ PipQaVerdict evaluatePipQaLog(
       _num(diagnosticsLast['enqueued']) - _num(diagnosticsFirst['enqueued']);
   final positionDelta =
       _num(diagnosticsLast['position']) - _num(diagnosticsFirst['position']);
-  final rate = _num(diagnosticsLast['timebaseRate']);
   final armed = diagnosticsLast['armed'] == true;
   final attached = diagnosticsLast['hostAttached'] == true;
   final layerReady = diagnosticsLast['layerReady'] == true;
@@ -113,10 +155,11 @@ PipQaVerdict evaluatePipQaLog(
       '${diagnosticsLast['layerDetached'] == true ? '是' : '否'}',
     );
   }
-  if (paused || rate < 0 || positionDelta < elapsed * 0.35) {
+  if (paused || _hasStoppedTimebaseRate(diagnosticsLast) ||
+      positionDelta < elapsed * 0.35) {
     return const PipQaVerdict(
       false,
-      '后台播放源停了：检查 paused / timebaseRate / position',
+      '后台播放源停了：检查 paused / 播放速率 / position',
     );
   }
   if (enqueuedDelta < elapsed * 5 || sameFrameWindows > 0) {
@@ -159,7 +202,7 @@ PipQaVerdict? _evaluateAnyWindow(
   final positionDelta =
       _num(lastDiag['position']) - _num(firstDiag['position']);
   final paused = lastDiag['paused'] == true;
-  final rate = _num(lastDiag['timebaseRate']);
+  final rate = _effectiveTimebaseRate(lastDiag);
   final flickerReason = _flickerReason(
     firstDiag,
     lastDiag,
@@ -168,14 +211,14 @@ PipQaVerdict? _evaluateAnyWindow(
   final stalls = _countStalls(usable, _num(firstDiag['enqueued']));
   final detail = paused
       ? '播放源暂停'
-      : rate < 0
-          ? '时间轴速率异常'
+      : _hasStoppedTimebaseRate(lastDiag)
+          ? '播放源速率 ${rate.toStringAsFixed(2)}'
           : flickerReason ?? '生命周期读数未标记为后台';
   return PipQaVerdict(
     false,
     '前台小窗 ${elapsed.toStringAsFixed(1)} 秒不能代替 Home 后台判定：'
         '入队 +${enqueuedDelta.round()}、进度 +${positionDelta.toStringAsFixed(1)} 秒、'
-        '停滞窗口 $stalls、时间轴速率 ${rate.toStringAsFixed(2)}、$detail',
+        '停滞窗口 $stalls、播放速率 ${rate.toStringAsFixed(2)}、$detail',
   );
 }
 
@@ -203,7 +246,7 @@ PipQaVerdict? _evaluateNativeBackground(
   );
   final didStartDelta = hasStart
       ? _counterDelta(start, end, 'didStart')
-      : -1;
+      : -1.0;
   if (end.isNotEmpty) {
     final verdict = _nativeBackgroundVerdict(
       end,
@@ -223,7 +266,7 @@ PipQaVerdict? _evaluateNativeBackground(
         diagnostics,
         needed,
         pipVisible: pipVisible,
-        didStartDelta: hasStart ? didStartDelta : -1,
+        didStartDelta: hasStart ? didStartDelta : -1.0,
         allowedFlushDelta: allowedFlushDelta,
       );
       if (verdict != null) return verdict;
@@ -442,16 +485,20 @@ PipQaVerdict? _evaluateNativeDiag(
   }
   final first = background.first;
   final last = background.last;
-  final elapsed = _num(typed.last['ts']) - _num(first['ts']);
-  final enqueuedDelta = _num(last['bgEnqueued']) - _num(first['bgEnqueued']);
-  final positionDelta = _num(last['progress']) - _num(first['progress']);
+  final end = typed.lastWhere(
+    (event) => _text(event['event']) == 'foreground',
+    orElse: () => last,
+  );
+  final elapsed = _num(end['ts']) - _num(first['ts']);
+  final enqueuedDelta = _num(end['bgEnqueued']) - _num(first['bgEnqueued']);
+  final positionDelta = _num(end['progress']) - _num(first['progress']);
   final startCallsDelta =
-      _num(last['startCalls']) - _num(first['startCalls']);
-  final didStartDelta = _num(last['didStart']) - _num(first['didStart']);
+      _num(end['startCalls']) - _num(first['startCalls']);
+  final didStartDelta = _num(end['didStart']) - _num(first['didStart']);
   final sameFrameDelta =
-      _num(last['sameFrame']) - _num(first['sameFrame']);
-  final flushDelta = _num(last['flushShown']) - _num(first['flushShown']);
-  final stallDelta = _num(last['stallShown']) - _num(first['stallShown']);
+      _num(end['sameFrame']) - _num(first['sameFrame']);
+  final flushDelta = _num(end['flushShown']) - _num(first['flushShown']);
+  final stallDelta = _num(end['stallShown']) - _num(first['stallShown']);
   final showing = background.any((event) => event['showing'] == true);
   final hostAttached = background.any(
     (event) => event['hostAttached'] == true,
@@ -482,13 +529,11 @@ PipQaVerdict? _evaluateNativeDiag(
     );
   }
   final bad = !visible ||
-      didStartDelta < 1 ||
-      startCallsDelta < 1 ||
       enqueuedDelta < elapsed * 5 ||
       sameFrameDelta >= enqueuedDelta * 0.8 ||
       positionDelta < elapsed * 0.35 ||
       last['paused'] == true ||
-      _num(last['timebaseRate']) < 0 ||
+      _hasStoppedTimebaseRate(last) ||
       flushDelta > allowedFlushDelta ||
       stallDelta > elapsed * 2 ||
       lastOwner == 'none' ||
@@ -575,21 +620,18 @@ PipQaVerdict? _nativeBackgroundVerdict(
   final baseline = start ?? _map(diagnostics['start']);
   final hasStart = baseline.isNotEmpty;
   final flush =
-      hasStart ? _counterDelta(baseline, diagnostics, 'flushShown') : -1;
+      hasStart ? _counterDelta(baseline, diagnostics, 'flushShown') : -1.0;
   final stall =
-      hasStart ? _counterDelta(baseline, diagnostics, 'stallShown') : -1;
+      hasStart ? _counterDelta(baseline, diagnostics, 'stallShown') : -1.0;
   final rebuilds =
-      hasStart ? _counterDelta(baseline, diagnostics, 'controllerRebuild') : -1;
+      hasStart ? _counterDelta(baseline, diagnostics, 'controllerRebuild') : -1.0;
   final sameFrameShownDelta =
-      hasStart ? _counterDelta(baseline, diagnostics, 'sameFrameShown') : -1;
+      hasStart ? _counterDelta(baseline, diagnostics, 'sameFrameShown') : -1.0;
   final owner = _text(diagnostics['layerOwner']);
   final bad = !pipVisible ||
       enqueued < seconds * 5 ||
       sameFrame >= enqueued * 0.8 ||
       position < seconds * 0.35 ||
-      starts < 1 ||
-      didStart < 1 ||
-      (hasStart && didStartDelta >= 0 && didStartDelta < 1) ||
       (hasStart &&
           (flush > allowedFlushDelta ||
               stall > seconds * 2 ||
@@ -597,7 +639,7 @@ PipQaVerdict? _nativeBackgroundVerdict(
               sameFrameShownDelta > 3)) ||
       owner != 'system' ||
       diagnostics['paused'] == true ||
-      _num(diagnostics['timebaseRate']) < 0;
+      _hasStoppedTimebaseRate(diagnostics);
   final cumulativeDetail = hasStart
       ? '清屏 ${_deltaText(flush)}、补帧 ${_deltaText(stall)}、'
           '重建 ${_deltaText(rebuilds)}、同帧 ${_deltaText(sameFrameShownDelta)}'
@@ -705,6 +747,51 @@ double _counterDelta(
 
 String _deltaText(double value) => value < 0 ? '未知' : '+${value.round()}';
 
+bool _hasForegroundPipStartEvidence(
+  Map<String, dynamic> log,
+  PipQaConfig config,
+  List<Map<String, Object?>> samples,
+) {
+  if (!config.requiresForegroundPipStart) return true;
+  final evidence = _map(log['manualStartEvidence']);
+  if (evidence['foregroundStartOrdered'] == true ||
+      _num(evidence['foregroundPipStarts']) > 0 ||
+      _num(evidence['sessionForegroundPipStarts']) > 0 ||
+      (evidence['sessionPipActive'] == true &&
+          _text(evidence['sessionAppState']) == 'active')) {
+    return true;
+  }
+  final summaryStart = _map(_map(log['backgroundSummary'])['start']);
+  if (_isForegroundPipStartSnapshot(summaryStart)) return true;
+  for (final sample in samples) {
+    final diagnostics = _map(sample['diagnostics']);
+    if (_isBackgroundDiagnostics(diagnostics)) break;
+    if (_isForegroundPipStartSnapshot(diagnostics)) return true;
+  }
+  final nativeEvents = _map(log['nativeDiag'])['events'];
+  if (nativeEvents is List) {
+    final typed = nativeEvents
+        .whereType<Map>()
+        .map(_map)
+        .toList(growable: false);
+    for (final event in typed) {
+      if (_text(event['appState']) == 'background' ||
+          _text(event['event']) == 'background') {
+        break;
+      }
+      if (_isForegroundPipStartSnapshot(event)) return true;
+    }
+  }
+  return false;
+}
+
+bool _isForegroundPipStartSnapshot(Map<String, Object?> snapshot) {
+  if (snapshot.isEmpty) return false;
+  return snapshot['showing'] == true ||
+      _num(snapshot['didStart']) > 0 ||
+      _num(snapshot['startCalls']) > 0;
+}
+
 int _countStalls(List<Map<String, Object?>> samples, double baseline) {
   var stalls = 0;
   var lastEnqueued = baseline;
@@ -720,6 +807,17 @@ int _countStalls(List<Map<String, Object?>> samples, double baseline) {
     lastEnqueued = enqueued;
   }
   return stalls;
+}
+
+double _effectiveTimebaseRate(Map<String, Object?> diagnostics) {
+  final rate = _num(diagnostics['timebaseRate']);
+  if (rate >= 0) return rate;
+  return diagnostics['paused'] == true ? 0.0 : 1.0;
+}
+
+bool _hasStoppedTimebaseRate(Map<String, Object?> diagnostics) {
+  final rate = _num(diagnostics['timebaseRate']);
+  return rate >= 0 && rate < 1 && diagnostics['paused'] != true;
 }
 
 Map<String, Object?> _map(Object? value) {

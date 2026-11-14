@@ -23,6 +23,19 @@ Future<void> _pipQaWriteQueue = Future<void>.value();
 int _pipQaWriteSequence = 0;
 int _pipQaFinalSequence = 0;
 
+Map<String, Object?> _foregroundPipStartEvidence(PipQaConfig config) {
+  final session = ShortVideoSession.instance;
+  return <String, Object?>{
+    'required': config.requiresForegroundPipStart,
+    'mode': config.pipMode,
+    'foregroundStartOrdered': PipQaRuntime.manualStartOrdered,
+    'foregroundPipStarts': PipQaRuntime.foregroundPipStarts,
+    'sessionForegroundPipStarts': session.foregroundPipStarts,
+    'sessionAppState': session.appState,
+    'sessionPipActive': session.pipActive && session.appState == 'active',
+  };
+}
+
 Future<void> _writePipQaLog(
   Map<String, Object?> payload, {
   bool finalWrite = false,
@@ -124,6 +137,7 @@ final class PipQaRecorder {
       'verdict': '自动 QA 正在采样，等待切后台与回前台',
       'samples': _samples,
       'sampleSeconds': _sampleSeconds,
+      'manualStartEvidence': _foregroundPipStartEvidence(config),
     });
   }
 
@@ -159,6 +173,7 @@ final class PipQaRecorder {
         'nativeDiag': nativeDiag,
         'hostDiag': hostDiag,
         'finalSnapshot': const <String, Object?>{},
+        'manualStartEvidence': _foregroundPipStartEvidence(config),
       },
       finalWrite: true,
     );
@@ -197,6 +212,7 @@ final class PipQaRecorder {
         'nativeDiag': _nativeDiag,
         'hostDiag': _hostDiag,
         'finalSnapshot': _finalSnapshot,
+        'manualStartEvidence': _foregroundPipStartEvidence(config),
       }, finalWrite: true);
     }
     return <String, dynamic>{
@@ -211,6 +227,7 @@ final class PipQaRecorder {
       'hostDiag': _hostDiag,
       'samples': List<Map<String, Object?>>.of(_samples),
       'finalSnapshot': _finalSnapshot,
+      'manualStartEvidence': _foregroundPipStartEvidence(config),
     };
   }
 
@@ -231,6 +248,7 @@ final class PipQaRecorder {
       'nativeDiag': _nativeDiag,
       'hostDiag': _hostDiag,
       'finalSnapshot': _finalSnapshot,
+      'manualStartEvidence': _foregroundPipStartEvidence(config),
     }, finalWrite: true);
   }
 
@@ -256,6 +274,7 @@ final class PipQaRecorder {
       'nativeDiag': _nativeDiag,
       'hostDiag': _hostDiag,
       'finalSnapshot': _finalSnapshot,
+      'manualStartEvidence': _foregroundPipStartEvidence(config),
     }, finalWrite: true);
   }
 

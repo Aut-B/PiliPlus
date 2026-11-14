@@ -17,22 +17,27 @@ class PipQaConfig {
     this.seedKeys = const <String>[],
   });
 
-  factory PipQaConfig.fromJson(Map<String, dynamic> json) => PipQaConfig(
-    enabled: json['enabled'] == true,
-    runId: '${json['runId'] ?? ''}',
-    index: (json['index'] as num?)?.toInt() ?? 0,
-    playSeconds: (json['playSeconds'] as num?)?.toInt() ?? 8,
-    backgroundSeconds:
-        (json['backgroundSeconds'] as num?)?.toInt() ?? 10,
-    advanceEvery: (json['advanceEvery'] as num?)?.toInt() ?? 0,
-    autoStart: json['autoStart'] != false,
-    pipMode: _normalizePipMode(json['pipMode']),
-    seedKeys:
-        (json['seedKeys'] as List?)
-            ?.map((value) => '$value')
-            .toList(growable: false) ??
-        const <String>[],
-  );
+  factory PipQaConfig.fromJson(Map<String, dynamic> json) {
+    final configuredRunId = '${json['runId'] ?? ''}'.trim();
+    return PipQaConfig(
+      enabled: json['enabled'] == true,
+      runId: configuredRunId.isEmpty
+          ? 'qa-${DateTime.now().microsecondsSinceEpoch}'
+          : configuredRunId,
+      index: (json['index'] as num?)?.toInt() ?? 0,
+      playSeconds: (json['playSeconds'] as num?)?.toInt() ?? 8,
+      backgroundSeconds:
+          (json['backgroundSeconds'] as num?)?.toInt() ?? 10,
+      advanceEvery: (json['advanceEvery'] as num?)?.toInt() ?? 0,
+      autoStart: json['autoStart'] != false,
+      pipMode: _normalizePipMode(json['pipMode']),
+      seedKeys:
+          (json['seedKeys'] as List?)
+              ?.map((value) => '$value')
+              .toList(growable: false) ??
+          const <String>[],
+    );
+  }
 
   final bool enabled;
   final String runId;
@@ -56,7 +61,19 @@ class PipQaConfig {
   int get effectiveBackgroundSeconds => backgroundSeconds.clamp(2, 60);
   int get effectiveAdvanceEvery => advanceEvery.clamp(0, 30);
 
-  /// 当前进程正在执行的 QA 配置；会驱动自动 QA 启动、原生 QA 模式与判定收尾。
+  /// 切后台前由 QA 在前台启动小窗的对照模式。
+  ///
+  /// 仅约束 Dart / QA 层：当前锁定的 `pip-6s` fork 不识别任何 QA 模式 API，
+  /// 所有模式都走同一套原生自动画中画；`bili` 不是另一套原生 PiP 实现，也不是
+  /// 「B 站后台自动进入」路径，只是在系统自动进入仍开启的状态下，由 QA 先显式启动一次。
+  bool get requiresForegroundPipStart =>
+      pipMode == 'manual' || pipMode == 'bili';
+
+  /// 诊断文案用模式名，避免把 `bili` 错报成「手动模式」。
+  String get foregroundPipStartLabel =>
+      pipMode == 'bili' ? '前台启动对照模式' : '手动模式';
+
+  /// 当前进程正在执行的 QA 配置；会驱动自动 QA 启动、采样与判定收尾。
   static PipQaConfig? active;
 
   static const String fileName = 'pip_qa.json';
@@ -70,14 +87,23 @@ abstract final class PipQaRuntime {
   static Completer<void>? _ready;
   static Completer<void>? _finished;
   static bool _started = false;
+  static int foregroundPipStarts = 0;
+  static bool manualStartOrdered = false;
   static String? failureVerdict;
 
   static void begin(PipQaConfig config) {
     PipQaConfig.active = config;
     failureVerdict = null;
     _started = true;
+    foregroundPipStarts = 0;
+    manualStartOrdered = false;
     _ready = Completer<void>();
     _finished = Completer<void>();
+  }
+
+  static void markForegroundPipStart({bool manual = false}) {
+    foregroundPipStarts += 1;
+    if (manual) manualStartOrdered = true;
   }
 
   static void markReady() {

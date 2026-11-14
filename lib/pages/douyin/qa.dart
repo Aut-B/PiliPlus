@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_session.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/qa_config.dart';
 import 'package:PiliPlus/pages/douyin/qa_recorder.dart';
@@ -65,6 +66,7 @@ Future<void> startPipQaIfRequested(PipQaConfig? config) async {
   );
   if (config == null || !config.autoStart) return;
   PipQaRuntime.begin(config);
+  ShortVideoSession.instance.resetPipQaCounters();
   try {
     final queue = buildPipQaQueue(config);
     if (queue.isEmpty) {
@@ -141,6 +143,33 @@ Future<void> _drivePipQaLifecycle(PipQaConfig config) async {
   await Future<void>.delayed(
     Duration(seconds: config.effectivePlaySeconds),
   );
+  final foregroundStartLabel = config.foregroundPipStartLabel;
+  if (config.requiresForegroundPipStart) {
+    try {
+      await ShortVideoSession.instance.startPip();
+      final session = ShortVideoSession.instance;
+      final hasForegroundStart = PipQaRuntime.manualStartOrdered ||
+          PipQaRuntime.foregroundPipStarts > 0 ||
+          session.foregroundPipStarts > 0 ||
+          (session.appState == 'active' && session.pipActive);
+      if (!hasForegroundStart) {
+        await _finishQaWithFailure(
+          config,
+          '$foregroundStartLabel没有记录到前台启动画中画：'
+          '本次命令和已有前台小窗都没有证据；'
+          '自动 QA 无法采样后台小窗',
+        );
+        return;
+      }
+    } catch (error) {
+      await _finishQaWithFailure(
+        config,
+        '$foregroundStartLabel无法在前台启动画中画：$error；'
+        '自动 QA 无法采样后台小窗',
+      );
+      return;
+    }
+  }
   try {
     await const MethodChannel('PiliPlus/PipQa').invokeMethod<void>(
       'background',
