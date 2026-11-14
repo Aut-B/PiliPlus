@@ -282,7 +282,7 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
     let scheduleResume: () -> Void = {
       CFRunLoopPerformBlock(
         CFRunLoopGetMain(),
-        kCFRunLoopCommonModes as CFTypeRef,
+        CFRunLoopMode.commonModes.rawValue as CFTypeRef,
         applyResume
       )
       CFRunLoopWakeUp(CFRunLoopGetMain())
