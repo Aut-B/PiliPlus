@@ -68,7 +68,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   bool? _autoPipArmedValue;
   Object? _nativePipModeFor;
   String? _nativePipMode;
-  String? _nativePipRunId;
+  String? _nativePipRunIdCached;
   bool _foregroundPipStartInFlight = false;
   bool _pipStartOrdered = false;
   int _pipStartGeneration = 0;
@@ -282,7 +282,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
         _autoPipArmedValue == armedValue &&
         identical(_nativePipModeFor, current) &&
         _nativePipMode == nativeMode &&
-        _nativePipRunId == nativeRunId) {
+        _nativePipRunIdCached == nativeRunId) {
       return;
     }
     try {
@@ -294,7 +294,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
       _autoPipArmedValue = armedValue;
       _nativePipModeFor = current;
       _nativePipMode = nativeMode;
-      _nativePipRunId = nativeRunId;
+      _nativePipRunIdCached = nativeRunId;
     } catch (_) {}
   }
 
