@@ -23,6 +23,9 @@ import WebKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliPlusPipQa") {
       PipQaLifecyclePlugin.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliPlusQaDump") {
+      QaDumpPlugin.register(with: registrar)
+    }
   }
 }
 
@@ -1089,5 +1092,84 @@ final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
       UIApplication.shared.open(url, options: [:], completionHandler: nil)
     }
     decisionHandler(.cancel)
+  }
+}
+
+/// 把自动体检结果落盘，同时分段打进系统日志。
+///
+/// 手机上装的包是 TrollStore 版，用 USB 的 house_arrest 取 Documents 会
+/// InstallationLookupFailed，所以必须留一条能读回来的通道：
+/// 1. Documents 里的文件（给用户自己在「文件」里看）；
+/// 2. /private/var/mobile/Media/piliplus_qa/（AFC 能直接拉）；
+/// 3. NSLog 分段输出（`pymobiledevice3 syslog` 能抓到，最保险）。
+final class QaDumpPlugin: NSObject, FlutterPlugin {
+  static let channelName = "PiliPlus/QaDump"
+  static let mediaDir = "/private/var/mobile/Media/piliplus_qa"
+  private static let chunkSize = 600
+
+  static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: channelName,
+      binaryMessenger: registrar.messenger()
+    )
+    registrar.addMethodCallDelegate(QaDumpPlugin(), channel: channel)
+  }
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard call.method == "write" else {
+      result(FlutterMethodNotImplemented)
+      return
+    }
+    guard let args = call.arguments as? [String: Any],
+          let name = args["name"] as? String,
+          !name.isEmpty,
+          let content = args["content"] as? String
+    else {
+      result(FlutterError(code: "bad_args", message: "missing name/content", details: nil))
+      return
+    }
+    let safeName = name
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "..", with: "_")
+    var written: [String] = []
+    if let docs = NSSearchPathForDirectoriesInDomains(
+      .documentDirectory,
+      .userDomainMask,
+      true
+    ).first {
+      let path = (docs as NSString).appendingPathComponent(safeName)
+      if (try? content.write(toFile: path, atomically: true, encoding: .utf8)) != nil {
+        written.append(path)
+      }
+    }
+    do {
+      try FileManager.default.createDirectory(
+        atPath: Self.mediaDir,
+        withIntermediateDirectories: true
+      )
+      let path = (Self.mediaDir as NSString).appendingPathComponent(safeName)
+      if (try? content.write(toFile: path, atomically: true, encoding: .utf8)) != nil {
+        written.append(path)
+      }
+    } catch {
+      NSLog("[PIPQA] %@", "media dir unavailable: \(error.localizedDescription)")
+    }
+    Self.logChunks(name: safeName, content: content)
+    result(written)
+  }
+
+  private static func logChunks(name: String, content: String) {
+    NSLog("[PIPQA] %@", "BEGIN \(name) bytes=\(content.utf8.count)")
+    var index = content.startIndex
+    var part = 0
+    while index < content.endIndex {
+      let next = content.index(index, offsetBy: chunkSize, limitedBy: content.endIndex)
+        ?? content.endIndex
+      let chunk = String(content[index..<next])
+      NSLog("[PIPQA] %@", "\(name) #\(part) \(chunk)")
+      part += 1
+      index = next
+    }
+    NSLog("[PIPQA] %@", "END \(name) parts=\(part)")
   }
 }

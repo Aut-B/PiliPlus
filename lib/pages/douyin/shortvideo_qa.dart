@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// 三条主需求的自动体检。
@@ -18,6 +19,11 @@ import 'package:path_provider/path_provider.dart';
 abstract final class ShortVideoQa {
   static const String resultFileName = 'shortvideo_qa_result.json';
   static const String historyFileName = 'shortvideo_qa_history.jsonl';
+
+  /// 写文件之外再走一条能读回来的通道：原生侧会把内容落到
+  /// `/private/var/mobile/Media/piliplus_qa/` 并用 NSLog 分段打印，
+  /// 这样即使 USB 拉不到 Documents，也能从系统日志里还原结果。
+  static const MethodChannel _dump = MethodChannel('PiliPlus/QaDump');
 
   static bool _scheduled = false;
   static final List<Timer> _timers = [];
@@ -166,10 +172,10 @@ abstract final class ShortVideoQa {
   }
 
   static Future<void> _write(Map<String, Object?> result) async {
+    final encoded = jsonEncode(result);
     try {
       final dir = await getApplicationDocumentsDirectory();
-      await File('${dir.path}/$resultFileName')
-          .writeAsString(jsonEncode(result), flush: true);
+      await File('${dir.path}/$resultFileName').writeAsString(encoded, flush: true);
       await File('${dir.path}/$historyFileName').writeAsString(
         '${jsonEncode(<String, Object?>{
           'at': result['generatedAt'],
@@ -179,6 +185,12 @@ abstract final class ShortVideoQa {
         mode: FileMode.append,
         flush: true,
       );
+    } catch (_) {}
+    try {
+      await _dump.invokeMethod<List<Object?>>('write', <String, Object?>{
+        'name': resultFileName,
+        'content': encoded,
+      });
     } catch (_) {}
   }
 }
