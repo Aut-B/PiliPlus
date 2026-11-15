@@ -538,7 +538,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
       armPip(force: true).then((_) {
         if (!ready || !playing || pipActive || appState == 'resumed') return;
         Future<void>.delayed(
-          const Duration(milliseconds: 350 + Random().nextInt(250)),
+          Duration(milliseconds: 350 + Random().nextInt(250)),
           () {
             if (_disposed || !ready || !playing || pipActive) return;
             if (appState == 'resumed') return;

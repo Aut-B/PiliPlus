@@ -15,8 +15,6 @@ import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
-import 'package:PiliPlus/utils/storage.dart';
-import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
     show Clipboard, ClipboardData, DeviceOrientation, SystemChrome, SystemUiMode;
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -784,7 +782,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         if (currentIndex < 0) return;
         _index = currentIndex;
         _playingKey = restoreKey;
-        _markShufflePlayed(restoreKey);
+        _markShufflePlayed(entry.key);
         _ready = true;
         _playing = _session.playing;
         _syncVideoSize();
