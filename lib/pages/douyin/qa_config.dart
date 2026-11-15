@@ -13,7 +13,7 @@ class PipQaConfig {
     required this.backgroundSeconds,
     this.advanceEvery = 0,
     this.autoStart = true,
-    this.pipMode = 'legacy',
+    this.pipMode = 'system',
     this.seedKeys = const <String>[],
   });
 
@@ -53,7 +53,7 @@ class PipQaConfig {
     final mode = '$value';
     return const <String>{'legacy', 'system', 'manual', 'bili'}.contains(mode)
         ? mode
-        : 'legacy';
+        : 'system';
   }
 
   /// 把外部配置收敛到安全范围，保证采样、后台、判定和收尾用同一组秒数。
@@ -61,13 +61,19 @@ class PipQaConfig {
   int get effectiveBackgroundSeconds => backgroundSeconds.clamp(2, 60);
   int get effectiveAdvanceEvery => advanceEvery.clamp(0, 30);
 
-  /// 切后台前由 QA 在前台启动小窗的对照模式。
+  /// 短视频默认交给系统画中画自动接管，不启用 30fps 保活与反复补帧。
   ///
-  /// 仅约束 Dart / QA 层：当前锁定的 `pip-6s` fork 不识别任何 QA 模式 API，
-  /// 所有模式都走同一套原生自动画中画；`bili` 不是另一套原生 PiP 实现，也不是
-  /// 「B 站后台自动进入」路径，只是在系统自动进入仍开启的状态下，由 QA 先显式启动一次。
+  /// `legacy|system` 下发原生 `system`；`manual|bili` 保留手动/对照路径。
+  /// B 站播放器不调用这个模式接口，仍走它自己的默认路径。
   bool get requiresForegroundPipStart =>
       pipMode == 'manual' || pipMode == 'bili';
+
+  /// 下发给 `media_kit_video` 的原生画中画模式。
+  String get effectiveNativePipMode =>
+      requiresForegroundPipStart ? pipMode : 'system';
+
+  /// 原生诊断日志使用的运行编号，避免多次回归的读数混在一起。
+  String get nativePipRunId => runId;
 
   /// 诊断文案用模式名，避免把 `bili` 错报成「手动模式」。
   String get foregroundPipStartLabel =>

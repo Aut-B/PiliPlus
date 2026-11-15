@@ -66,6 +66,9 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   Object? _autoPipArmedFor;
   bool? _autoPipArmedValue;
+  Object? _nativePipModeFor;
+  String? _nativePipMode;
+  String? _nativePipRunId;
   bool _foregroundPipStartInFlight = false;
   bool _pipStartOrdered = false;
   int _pipStartGeneration = 0;
@@ -87,7 +90,13 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   bool get ready => !_disposed && player != null && controller != null;
   bool get pipHold => _iosPipHold;
-  String get pipQaMode => PipQaConfig.active?.pipMode ?? 'legacy';
+  String get pipQaMode => PipQaConfig.active?.pipMode ?? 'system';
+
+  String get _effectiveNativePipMode =>
+      PipQaConfig.active?.effectiveNativePipMode ?? 'system';
+
+  String get _nativePipRunId =>
+      PipQaConfig.active?.nativePipRunId ?? 'short-video-system';
 
   Future<void> ensureReady() {
     if (_disposed) return Future<void>.value();
@@ -266,17 +275,39 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     if (!bypassGuard && (_foregroundPipStartInFlight || pipActive)) return;
     final qaConfig = PipQaConfig.active;
     final armedValue = qaConfig != null || autoPiP;
+    final nativeMode = _effectiveNativePipMode;
+    final nativeRunId = _nativePipRunId;
     if (reuseCachedArm &&
         identical(_autoPipArmedFor, current) &&
-        _autoPipArmedValue == armedValue) {
+        _autoPipArmedValue == armedValue &&
+        identical(_nativePipModeFor, current) &&
+        _nativePipMode == nativeMode &&
+        _nativePipRunId == nativeRunId) {
       return;
     }
     try {
+      await _applyNativePipMode(current, nativeMode, nativeRunId);
       await forceOverlayOff();
       await _forcePipDanmakuOff(current);
       await current.setAutoEnterPictureInPicture(armedValue);
       _autoPipArmedFor = current;
       _autoPipArmedValue = armedValue;
+      _nativePipModeFor = current;
+      _nativePipMode = nativeMode;
+      _nativePipRunId = nativeRunId;
+    } catch (_) {}
+  }
+
+  Future<void> _applyNativePipMode(
+    VideoController current,
+    String mode,
+    String runId,
+  ) async {
+    try {
+      await (current as dynamic).setPictureInPictureQaMode(
+        mode,
+        runId: runId,
+      );
     } catch (_) {}
   }
 
@@ -296,10 +327,16 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
 
   Future<void> prepareForNewMedia() async {
     if (!Platform.isIOS || !ready) return;
+    final current = controller!;
     try {
+      await _applyNativePipMode(
+        current,
+        _effectiveNativePipMode,
+        _nativePipRunId,
+      );
       await forceOverlayOff();
-      await _forcePipDanmakuOff(controller!);
-      await controller!.preparePictureInPictureForNewMedia();
+      await _forcePipDanmakuOff(current);
+      await current.preparePictureInPictureForNewMedia();
     } catch (_) {}
   }
 

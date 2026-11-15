@@ -529,7 +529,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         foregroundStartRequired:
             (PipQaConfig.active?.requiresForegroundPipStart ??
                 (_session.pipQaMode == 'manual')),
-        modeLabel: PipQaConfig.active?.foregroundPipStartLabel ?? '手动模式',
+        modeLabel: PipQaConfig.active?.foregroundPipStartLabel ??
+            '系统自动接管模式',
       ),
     );
   }
@@ -1911,12 +1912,12 @@ class _PipDiagnosticsSheet extends StatefulWidget {
     required this.controller,
     this.fgPipStarts = 0,
     this.foregroundStartRequired = false,
-    this.modeLabel = '手动模式',
+    this.modeLabel = '系统自动接管模式',
   });
 
   final VideoController controller;
 
-  /// 切后台前「前台主动开小窗」的次数，0 表示这次还是走了系统自动进入。
+  /// 切后台前「前台主动开小窗」的次数；默认模式应为 0，由系统按 Home 自动接管。
   final int fgPipStarts;
 
   /// 前台启动模式只要求切后台前已有启动证据，不要求后台再次启动。
@@ -2083,7 +2084,9 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         return '小窗显示中补帧 ${stallShown.round()} 次 —— 渲染回调供帧不足';
       }
     }
-    if (_data['showing'] != true) return '小窗没在显示：先按 Home 让它自动进小窗';
+    if (_data['showing'] != true) {
+      return '小窗没在显示：默认按 Home 由系统自动接管';
+    }
     if (_noFrameSeconds >= 1.5) {
       return '帧没送进小窗：累计 ${_noFrameSeconds.round()} 秒';
     }
@@ -2269,7 +2272,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
             ),
             const Text(
               '入口：右上角心率图标 / 长按画面 1 秒 / 播放队列右上角。'
-              '进来后按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论。'
+              '默认按 Home 由系统自动接管小窗 → 等几秒 → 切回来看上面那行结论。'
               '「画字进小窗」只画文字，不再有红色色块',
               style: TextStyle(color: Colors.white38, fontSize: 11),
             ),
