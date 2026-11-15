@@ -13,7 +13,7 @@ typedef ShortVideoPlayerPageBuilder = Widget Function(
 });
 
 typedef ShortVideoQueueOpener =
-    Future<void> Function({
+    Future<bool> Function({
       required List<QueueEntry> queue,
       required int index,
       required bool replaceCurrent,
@@ -22,6 +22,7 @@ typedef ShortVideoQueueOpener =
 
 ShortVideoPlayerPageBuilder? _pageBuilder;
 ShortVideoQueueOpener? _queueOpener;
+final Set<Route<dynamic>> _playerRoutes = <Route<dynamic>>{};
 
 void registerShortVideoPlayerPageBuilder(ShortVideoPlayerPageBuilder builder) {
   _pageBuilder = builder;
@@ -33,6 +34,14 @@ void registerShortVideoQueueOpener(ShortVideoQueueOpener opener) {
 
 void unregisterShortVideoQueueOpener(ShortVideoQueueOpener opener) {
   if (identical(_queueOpener, opener)) _queueOpener = null;
+}
+
+void registerShortVideoPlayerRoute(Route<dynamic> route) {
+  _playerRoutes.add(route);
+}
+
+void unregisterShortVideoPlayerRoute(Route<dynamic> route) {
+  _playerRoutes.remove(route);
 }
 
 Widget buildShortVideoPlayerPage(
@@ -57,20 +66,32 @@ Future<void> openShortVideoQueue(
   if (queue.isEmpty) return;
   final opener = _queueOpener;
   if (opener != null) {
-    await opener(
+    final handled = await opener(
       queue: queue,
       index: index,
       showImmediately: showImmediately,
       replaceCurrent: replaceCurrent,
     );
-    return;
+    if (handled) return;
   }
-  await _defaultOpen(
+  await ShortVideoPlayerRouteNavigator.open(
     queue,
     index,
     showImmediately: showImmediately,
     replaceCurrent: replaceCurrent,
   );
+}
+
+void removeStaleShortVideoPlayerRoutes() {
+  final navigator = Get.key.currentState;
+  if (navigator == null) return;
+  final stale = _playerRoutes
+      .where((route) => !route.isCurrent)
+      .toList(growable: false);
+  for (final route in stale) {
+    unregisterShortVideoPlayerRoute(route);
+    if (route.isActive) navigator.removeRoute(route);
+  }
 }
 
 abstract final class ShortVideoPlayerRouteNavigator {
@@ -80,7 +101,7 @@ abstract final class ShortVideoPlayerRouteNavigator {
     required bool showImmediately,
     bool replaceCurrent = false,
   }) async {
-    await _defaultOpen(
+    await _openOrReplace(
       queue,
       index,
       showImmediately: showImmediately,
@@ -89,21 +110,30 @@ abstract final class ShortVideoPlayerRouteNavigator {
   }
 }
 
-Future<void> _defaultOpen(
+Future<void> _openOrReplace(
   List<QueueEntry> queue,
   int index, {
   required bool showImmediately,
   required bool replaceCurrent,
 }) async {
   if (queue.isEmpty) return;
+  removeStaleShortVideoPlayerRoutes();
   final page = () => buildShortVideoPlayerPage(
     queue,
     index,
     showImmediately: showImmediately,
   );
-  if (replaceCurrent && Get.currentRoute == ShortVideoPlayerRoute.routeName) {
-    await Get.off<void>(page);
+  if (replaceCurrent) {
+    await Get.off<void>(
+      page,
+      routeName: ShortVideoPlayerRoute.routeName,
+      preventDuplicates: false,
+    );
   } else {
-    await Get.to<void>(page, routeName: ShortVideoPlayerRoute.routeName);
+    await Get.to<void>(
+      page,
+      routeName: ShortVideoPlayerRoute.routeName,
+      preventDuplicates: false,
+    );
   }
 }

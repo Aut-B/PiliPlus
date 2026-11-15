@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
+import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 
 /// 播放队列里的一条。
@@ -154,6 +155,15 @@ Future<QueueMedia?> resolveQueueEntry(
 /// TikTok 的长期地址只认 App UA（见 [tiktokAppUserAgent]），所以探成功之后
 /// 播放也必须带同一个 UA，否则「探通了、播不了」。
 Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
+  final local = await ShortVideoMediaCache.localPath(video);
+  if (local != null) {
+    return QueueMedia(
+      url: local,
+      userAgent: '',
+      referer: '',
+      isLocal: true,
+    );
+  }
   final platform =
       ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;

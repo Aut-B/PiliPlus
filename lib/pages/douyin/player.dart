@@ -3,6 +3,7 @@ import 'dart:io' show File, Platform;
 import 'dart:math';
 
 import 'package:PiliPlus/build_config.dart';
+import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/player_session.dart';
@@ -82,8 +83,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Timer? _qaAdvanceTimer;
   Timer? _qaFinishTimer;
   int _qaAdvanceTick = 0;
+  bool get _qaAutoRunActive {
+    final config = PipQaConfig.active;
+    return config != null &&
+        config.enabled &&
+        config.autoStart &&
+        Platform.isIOS &&
+        PipQaRuntime.isStarted &&
+        !PipQaRuntime.isFinished;
+  }
 
   late final ShortVideoQueueOpener _queueOpener = _openFromBridge;
+  ModalRoute<dynamic>? _playerRoute;
 
   /// 已经解析过的播放地址（按条目 key 缓存）。
   final Map<String, QueueMedia> _resolved = {};
@@ -119,12 +130,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 先发起、后回来的那次必须自己作废——否则标题已经跳了、画面还是上一条。
   int _openToken = 0;
 
+  /// 换源期间旧画面的 completed / 末尾 tick 不能当成新视频播完。
+  bool _openInFlight = false;
+
   /// player.open 串行化：两次换源交叉会把上一条的画面和这一条的音频拼在一起。
   Future<void> _openLock = Future<void>.value();
 
   int _skipped = 0;
   int _videoWidth = 0;
   int _videoHeight = 0;
+
+  final Random _shuffleRandom = Random();
+  List<String> _shuffleDeck = const [];
+  String _shuffleQueueSignature = '';
+  final Set<String> _shufflePlayed = {};
 
   bool _ready = false;
 
@@ -221,6 +240,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     unawaited(_init());
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of<dynamic>(context);
+    if (identical(route, _playerRoute)) return;
+    final previousRoute = _playerRoute;
+    if (previousRoute != null) {
+      unregisterShortVideoPlayerRoute(previousRoute);
+    }
+    _playerRoute = route;
+    if (route != null) registerShortVideoPlayerRoute(route);
+  }
+
   Future<void> _restoreGestureState() async {
     try {
       final volume = await FlutterVolumeController.getVolume();
@@ -238,10 +270,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return;
     }
     try {
-        await _session.ensureReady();
+      await _session.ensureReady();
       if (!mounted) return;
       if (widget.showImmediately && _session.queue.isNotEmpty) {
-        _queue = List<QueueEntry>.of(_session.queue);
+        final sessionKeys = _session.queue.map((entry) => entry.key).toSet();
+        _queue = List<QueueEntry>.of(_session.queue)
+          ..addAll(
+            widget.queue.where((entry) => !sessionKeys.contains(entry.key)),
+          );
         _index = _clampedIndex(_session.index);
       }
       _publishSessionState();
@@ -258,6 +294,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         if (duration > Duration.zero &&
             position > Duration.zero &&
             duration - position <= const Duration(milliseconds: 500) &&
+            !_openInFlight &&
             !_completionFired) {
           _onCompleted();
         }
@@ -292,12 +329,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _scheduleHide();
       _attachQaIfNeeded();
     } catch (error) {
-      final config = PipQaConfig.active;
       final verdict = '短视频播放器初始化失败：$error';
-      if (config != null && Platform.isIOS) {
-        await _failRecorderQa(config, verdict);
-      } else {
-        PipQaRuntime.fail(verdict);
+      if (_qaAutoRunActive) {
+        final config = PipQaConfig.active;
+        if (config != null) {
+          await _failRecorderQa(config, verdict);
+        }
       }
       _showToast(verdict);
       if (mounted) setState(() => _ready = false);
@@ -306,7 +343,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   Future<void> _failQa(String verdict) async {
     final config = PipQaConfig.active;
-    if (config == null || !Platform.isIOS) return;
+    if (config == null || !_qaAutoRunActive) return;
     await _failRecorderQa(config, verdict);
   }
 
@@ -314,7 +351,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     PipQaConfig config,
     String verdict,
   ) async {
-    if (PipQaRuntime.isFinished) return;
+    if (!_qaAutoRunActive || PipQaRuntime.isFinished) return;
     PipQaRuntime.fail(verdict);
     _qaAdvanceTimer?.cancel();
     _qaFinishTimer?.cancel();
@@ -336,11 +373,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
   }
 
+  void _invalidateCurrentOpen() {
+    _openToken += 1;
+    _openInFlight = false;
+    _openedKey = null;
+    _playingKey = null;
+  }
+
   void _attachQaIfNeeded() {
     final config = PipQaConfig.active;
-    if (config == null || !Platform.isIOS || _queue.isEmpty) {
+    if (config == null || !_qaAutoRunActive) return;
+    if (_queue.isEmpty) {
       unawaited(
-        _failQa('短视频播放页没有可播放队列，自动 QA 无法开始'),
+        _failRecorderQa(config, '短视频播放页没有可播放队列，自动 QA 无法开始'),
       );
       return;
     }
@@ -368,7 +413,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         (_) {
           if (!mounted || _queue.length < 2) return;
           _qaAdvanceTick += 1;
-          unawaited(_jumpTo((_index + 1) % _queue.length));
+          if (_mode == ShortVideoLoopMode.shuffle) {
+            unawaited(_jumpTo(_nextShuffleIndex()));
+          } else {
+            unawaited(_jumpTo((_index + 1) % _queue.length));
+          }
         },
       );
     }
@@ -386,7 +435,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Future<void> _finishQa() async {
     final config = PipQaConfig.active;
     final recorder = _qaRecorder;
-    if (recorder == null || config == null) return;
+    if (recorder == null || config == null || !_qaAutoRunActive) {
+      _qaAdvanceTimer?.cancel();
+      _qaFinishTimer?.cancel();
+      _qaRecorder = null;
+      recorder?.close();
+      return;
+    }
     _qaRecorder = null;
     _qaAdvanceTimer?.cancel();
     _qaFinishTimer?.cancel();
@@ -433,24 +488,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     unawaited(_onPlaybackError(message));
   }
 
-  Future<void> _openFromBridge({
+  Future<bool> _openFromBridge({
     required List<QueueEntry> queue,
     required int index,
     required bool replaceCurrent,
     required bool showImmediately,
   }) async {
-    final samePage = Get.currentRoute == ShortVideoPlayerRoute.routeName ||
-        Get.routing.current == ShortVideoPlayerRoute.routeName;
-    if (samePage && mounted) {
+    if (!mounted) return false;
+    if (ModalRoute.of<dynamic>(context)?.isCurrent == true) {
       _applyQueue(queue, index, showImmediately: showImmediately);
-      return;
+      return true;
     }
-    await ShortVideoPlayerRouteNavigator.open(
-      queue,
-      index,
-      showImmediately: showImmediately,
-      replaceCurrent: replaceCurrent,
-    );
+    return false;
   }
 
   void _applyQueue(
@@ -473,11 +522,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         _resolved.clear();
         _retryStage = 0;
         _skipped = 0;
+        _resetShuffleBag();
       }
     });
+    _syncShuffleQueue();
     _publishSessionState();
-    if (restoreIndex >= 0) {
+        if (restoreIndex >= 0) {
       _openToken += 1;
+      _openInFlight = false;
       _playingKey = restoredKey;
       _openedKey = restoredKey;
       _playing = _session.playing;
@@ -486,6 +538,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _duration = _session.player?.state.duration ?? Duration.zero;
       _syncVideoSize();
       _publishSessionState();
+      _syncShuffleQueue();
       if (mounted) setState(() {});
       return;
     }
@@ -530,7 +583,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             (PipQaConfig.active?.requiresForegroundPipStart ??
                 (_session.pipQaMode == 'manual')),
         modeLabel: PipQaConfig.active?.foregroundPipStartLabel ??
-            '系统自动接管模式',
+            'B 站同款默认路径（legacy）',
       ),
     );
   }
@@ -578,6 +631,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return;
     }
     final added = ShortVideoPlaylistRepo.add(items);
+    ShortVideoAutoCache.schedule();
     _showToast(
       added == 0
           ? '这些已经在播放列表里了（共 ${ShortVideoPlaylistRepo.length} 条）'
@@ -588,6 +642,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 跳到第 index 条。
   Future<void> _jumpTo(int index) async {
     if (index < 0 || index >= _queue.length || index == _displayedIndex) return;
+    _markShufflePlayed(_queue[index].key);
     setState(() => _index = index);
     await _openIndex(index);
   }
@@ -600,15 +655,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return;
     }
     final playing = _current.key;
+    final removed = _queue[index];
     setState(() {
       _queue.removeAt(index);
       final next = _queue.indexWhere((e) => e.key == playing);
       _index = next >= 0 ? next : _clampedIndex(_index);
     });
     if (!_queue.any((e) => e.key == playing)) {
-      // 正在播的那条被删了：接着播现在落在 _index 上的这条。
-      _openIndex(_index);
+      _invalidateCurrentOpen();
+      _resolved.remove(removed.key);
+      unawaited(_openIndex(_index));
+    } else {
+      _publishSessionState();
     }
+    _syncShuffleQueue();
   }
 
   /// 调整顺序（上移 / 下移）。当前播放的那条跟着走，不会串台。
@@ -626,6 +686,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         _index = _clampedIndex(_index);
       }
     });
+    _publishSessionState();
+    _syncShuffleQueue();
   }
 
   /// 播放页里直接把抖音 / TikTok 的视频插到「下一首」。
@@ -651,7 +713,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return;
     }
     _queue.insert(_displayedIndex + 1, entry);
+    _syncShuffleQueue();
     setState(() {});
+    _publishSessionState();
     _showToast('已插到下一首：${picked.title}');
   }
 
@@ -666,69 +730,89 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }) async {
     if (_queue.isEmpty) return;
     final token = ++_openToken;
-    _index = _clampedIndex(index);
-    final entry = _queue[_index];
-    if (resetRetry) _retryStage = 0;
-    _publishSessionState();
-    _position = Duration.zero;
-    _duration = Duration.zero;
-    _seekPreview = null;
-    _completionFired = false;
-    _syncCachedState();
-    var media = _resolved[entry.key];
-    if (media == null) {
-      media = await _resolve(entry);
-      // 这次解析回来时已经过期了：用户又点了一条，交给新的那次。
-      if (token != _openToken || !mounted) return;
-      final currentIndex = _indexOfKey(entry.key);
-      if (currentIndex < 0) return;
-      _index = currentIndex;
+    _openInFlight = true;
+    try {
+      _index = _clampedIndex(index);
+      final entry = _queue[_index];
+      if (resetRetry) _retryStage = 0;
+      _publishSessionState();
+      _position = Duration.zero;
+      _duration = Duration.zero;
+      _seekPreview = null;
+      _completionFired = false;
+      _syncCachedState();
+      var media = _resolved[entry.key];
+      final video = entry.short;
+      if (video != null && (media == null || !media.isLocal)) {
+        final local = await ShortVideoMediaCache.localPath(video);
+        if (local != null) {
+          media = QueueMedia(
+            url: local,
+            userAgent: '',
+            referer: '',
+            isLocal: true,
+          );
+          _resolved[entry.key] = media;
+        }
+      }
       if (media == null) {
-        _skipBroken(currentIndex);
+        media = await _resolve(entry);
+        // 这次解析回来时已经过期了：用户又点了一条，交给新的那次。
+        if (token != _openToken || !mounted) return;
+        final currentIndex = _indexOfKey(entry.key);
+        if (currentIndex < 0) return;
+        _index = currentIndex;
+        if (media == null) {
+          _skipBroken(currentIndex);
+          return;
+        }
+        _resolved[entry.key] = media;
+      }
+      final player = _session.player;
+      if (player == null || !mounted || token != _openToken) return;
+      final url = media.url;
+      final headers = <String, String>{};
+      if (media.cookie.isNotEmpty) headers['Cookie'] = media.cookie;
+      player.setMediaHeader(
+        userAgent: media.userAgent,
+        referer: media.referer,
+        headers: headers,
+      );
+      _openedKey = entry.key;
+      if (restoreKey == entry.key && _session.ready) {
+        final currentIndex = _indexOfKey(entry.key);
+        if (currentIndex < 0) return;
+        _index = currentIndex;
+        _playingKey = restoreKey;
+        _markShufflePlayed(restoreKey);
+        _ready = true;
+        _playing = _session.playing;
+        _syncVideoSize();
+        _publishSessionState();
+        unawaited(_session.forceOverlayOff());
         return;
       }
-      _resolved[entry.key] = media;
-    }
-    final player = _session.player;
-    if (player == null || !mounted || token != _openToken) return;
-    final url = media.url;
-    final headers = <String, String>{};
-    if (media.cookie.isNotEmpty) headers['Cookie'] = media.cookie;
-    player.setMediaHeader(
-      userAgent: media.userAgent,
-      referer: media.referer,
-      headers: headers,
-    );
-    _openedKey = entry.key;
-    if (restoreKey == entry.key && _session.ready) {
-      final currentIndex = _indexOfKey(entry.key);
-      if (currentIndex < 0) return;
-      _index = currentIndex;
-      _playingKey = restoreKey;
-      _ready = true;
-      _playing = _session.playing;
-      _syncVideoSize();
-      _publishSessionState();
-      unawaited(_session.forceOverlayOff());
-      return;
-    }
-    await _session.prepareForNewMedia();
-    final opened = _openLock.then((_) async {
+      await _session.prepareForNewMedia();
+      final opened = _openLock.then((_) async {
+        if (token != _openToken || !mounted) return;
+        await player.open(Media(url), play: true);
+      });
+      _openLock = opened.then((_) {}, onError: (_) {});
+      await opened;
       if (token != _openToken || !mounted) return;
-      await player.open(Media(url), play: true);
-    });
-    _openLock = opened.then((_) {}, onError: (_) {});
-    await opened;
-    if (token != _openToken || !mounted) return;
-    final openedIndex = _indexOfKey(entry.key);
-    if (openedIndex < 0) return;
-    _index = openedIndex;
-    _playingKey = entry.key;
-    _publishSessionState();
-    await player.setRate(_speed);
-    if (token != _openToken || !mounted) return;
-    _syncVideoSize();
-    await _session.armPip();
+      final openedIndex = _indexOfKey(entry.key);
+      if (openedIndex < 0) return;
+      _index = openedIndex;
+      _playingKey = entry.key;
+      _markShufflePlayed(entry.key);
+      _publishSessionState();
+      await player.setRate(_speed);
+      if (token != _openToken || !mounted) return;
+      _syncVideoSize();
+      await _session.armPip();
+    } finally {
+      if (token == _openToken) _openInFlight = false;
+    }
   }
 
   /// 本地已经有缓存就直接播本地（TikTok 基本都走这条）。
@@ -854,6 +938,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final cookie = await ShortVideoWeb.cookieHeader(
       platform.cookieDomainNeedle,
     );
+    ShortVideoAutoCache.refreshProtection();
     if (!mounted) return;
     entryIndex = _indexOfKey(entry.key);
     if (entryIndex < 0) return;
@@ -934,6 +1019,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (video.playUrl.isNotEmpty) video.playUrl,
       ...stableUrls(video),
     ];
+    ShortVideoAutoCache.refreshProtection();
     final result = await ShortVideoMediaCache.download(
       video,
       urls: urls,
@@ -977,29 +1063,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   void _onCompleted() {
-    if (!mounted || _completionFired || _queue.isEmpty) return;
+    if (!mounted || _openInFlight || _completionFired || _queue.isEmpty) return;
     _completionFired = true;
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
     final current = _displayedIndex;
     switch (_mode) {
       case ShortVideoLoopMode.singleLoop:
-        _openIndex(current);
+        unawaited(_openIndex(current));
       case ShortVideoLoopMode.sequential:
         if (current + 1 >= _queue.length) {
           _showToast('已经是最后一条');
           return;
         }
         setState(() => _index = current + 1);
-        _openIndex(_index);
+        unawaited(_openIndex(_index));
       case ShortVideoLoopMode.shuffle:
-        final next = _randomIndex(current);
+        final next = _nextShuffleIndex();
         setState(() => _index = next);
-        _openIndex(next);
+        unawaited(_openIndex(next));
       case ShortVideoLoopMode.listLoop:
         final next = (current + 1) % _queue.length;
         setState(() => _index = next);
-        _openIndex(next);
+        unawaited(_openIndex(next));
     }
   }
 
@@ -1014,20 +1100,68 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return _playInjectedNext();
     }
     _queue.insert(currentIndex + 1, injected);
+    _syncShuffleQueue();
+    _markShufflePlayed(injected.key);
     setState(() => _index = currentIndex + 1);
-    _openIndex(_index);
+    _publishSessionState();
+    unawaited(_openIndex(_index));
     return true;
   }
 
-  int _randomIndex(int current) {
+  int _nextShuffleIndex() {
     if (_queue.isEmpty) return 0;
-    if (_queue.length <= 1) return current;
-    final random = Random();
-    var next = current;
-    while (next == current) {
-      next = random.nextInt(_queue.length);
+    if (_queue.length <= 1) return _displayedIndex;
+    _syncShuffleQueue();
+    if (_shuffleDeck.isEmpty) _startShuffleRound();
+    while (_shuffleDeck.isNotEmpty) {
+      final key = _shuffleDeck.removeAt(0);
+      if (key == _current.key) continue;
+      final index = _indexOfKey(key);
+      if (index < 0) continue;
+      _shufflePlayed.add(key);
+      return index;
     }
-    return next;
+    final fallbackIndex = _queue.indexWhere(
+      (entry) => entry.key != _current.key,
+    );
+    if (fallbackIndex < 0) return _displayedIndex;
+    _shufflePlayed.add(_queue[fallbackIndex].key);
+    return fallbackIndex;
+  }
+
+  void _startShuffleRound() {
+    final currentKey = _current.key;
+    final keys = _queue
+        .map((entry) => entry.key)
+        .where((key) => key != currentKey)
+        .toList();
+    keys.shuffle(_shuffleRandom);
+    _shuffleDeck = keys;
+    _shufflePlayed
+      ..clear()
+      ..add(currentKey);
+  }
+
+  void _resetShuffleBag() {
+    _shuffleDeck = const [];
+    _shuffleQueueSignature = '';
+    _shufflePlayed.clear();
+  }
+
+  void _syncShuffleQueue() {
+    final signature = _queue.map((entry) => entry.key).join('\u0000');
+    if (signature == _shuffleQueueSignature) return;
+    final knownKeys = _queue.map((entry) => entry.key).toSet();
+    _shuffleDeck = _shuffleDeck.where(knownKeys.contains).toList();
+    _shufflePlayed.retainWhere(knownKeys.contains);
+    _shuffleQueueSignature = signature;
+  }
+
+  void _markShufflePlayed(String key) {
+    _syncShuffleQueue();
+    if (_shufflePlayed.add(key)) {
+      _shuffleDeck.remove(key);
+    }
   }
 
   Future<void> _jump(int delta) async {
@@ -1036,12 +1170,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _showToast(delta > 0 ? '已经是最后一条' : '已经是第一条');
       return;
     }
+    _markShufflePlayed(_queue[next].key);
     setState(() => _index = next);
     await _openIndex(next);
   }
 
   void _cycleMode() {
-    setState(() => _mode = _mode.next);
+    setState(() {
+      _mode = _mode.next;
+      if (_mode == ShortVideoLoopMode.shuffle) _resetShuffleBag();
+    });
     // 不用 SnackBar：它从底部弹出来，正好盖住这一排按钮，
     // 连点两下就点不到了。改成画面中间的提示。
     _flashHint(_mode.label);
@@ -1185,6 +1323,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           content: Text(text),
           duration: const Duration(milliseconds: 1200),
           behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.fromLTRB(
+            12,
+            0,
+            12,
+            MediaQuery.of(context).padding.bottom + 96,
+          ),
         ),
       );
   }
@@ -1205,11 +1349,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   void dispose() {
     unregisterShortVideoQueueOpener(_queueOpener);
+    final playerRoute = _playerRoute;
+    if (playerRoute != null) unregisterShortVideoPlayerRoute(playerRoute);
     _session.detach(this);
     _qaAdvanceTimer?.cancel();
     _qaFinishTimer?.cancel();
     final qaRecorder = _qaRecorder;
-    if (qaRecorder != null && PipQaConfig.active != null && Platform.isIOS) {
+    if (qaRecorder != null && _qaAutoRunActive) {
       unawaited(_finishQa());
     } else {
       qaRecorder?.close();
@@ -1912,7 +2058,7 @@ class _PipDiagnosticsSheet extends StatefulWidget {
     required this.controller,
     this.fgPipStarts = 0,
     this.foregroundStartRequired = false,
-    this.modeLabel = '系统自动接管模式',
+    this.modeLabel = 'B 站同款默认路径（legacy）',
   });
 
   final VideoController controller;

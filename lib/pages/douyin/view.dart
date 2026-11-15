@@ -1,7 +1,10 @@
+import 'dart:async' show unawaited;
+
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
+import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
@@ -80,6 +83,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       final result = await ShortVideoSync.synchronize();
       if (!mounted) return;
       _reload();
+      ShortVideoAutoCache.schedule();
       var text = '已同步：${result.summary}';
       if (_videos.isEmpty && result.total > 0) {
         // 总数不为 0、本页却是空的：说明那些条目不属于当前平台，
@@ -109,6 +113,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       if (!mounted) return;
       _reload();
       setState(() => _status = '本地 ${_videos.length} 条');
+      ShortVideoAutoCache.schedule();
       _sync(silent: true);
     };
     try {
@@ -158,6 +163,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final archived = ShortVideoPlaylistRepo.add(
       parsed.map(PlaylistItem.fromShortVideo),
     );
+    ShortVideoAutoCache.schedule();
     if (mounted) {
       setState(
         () => _status = '已抓取 ${_videos.length} 条'
@@ -168,10 +174,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   void _play(int index) {
     if (_videos.isEmpty) return;
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: _videos.map(QueueEntry.fromShortVideo).toList(),
-        index: index,
+    unawaited(
+      openShortVideoQueue(
+        _videos.map(QueueEntry.fromShortVideo).toList(),
+        index,
+        replaceCurrent: true,
       ),
     );
   }
@@ -188,10 +195,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _selecting = false;
       _selected.clear();
     });
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: queue.map(QueueEntry.fromShortVideo).toList(),
-        index: 0,
+    unawaited(
+      openShortVideoQueue(
+        queue.map(QueueEntry.fromShortVideo).toList(),
+        0,
+        replaceCurrent: true,
       ),
     );
   }
@@ -237,8 +245,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     // 留墓碑：否则下一次同步会把这些条目从远端并回来。
     ShortVideoRepo.markDeleted(platform, keys);
     for (final video in videos) {
-      await ShortVideoMediaCache.remove(video);
+      if (!ShortVideoPlaylistRepo.contains('short:${video.key}')) {
+        await ShortVideoMediaCache.remove(video);
+      }
     }
+    ShortVideoAutoCache.refreshProtection();
     _offerUndo(videos, positions);
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
@@ -250,7 +261,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       title: const Text('删除这条收藏？'),
       content: Text(
         '${video.title}\n\n'
-        '只删本机这一条，本地缓存文件也一起删掉；'
+        '只删本机这一条；如果它还在播放列表里，本地视频文件会保留；'
         '下次同步时远端那份也会被排除。',
       ),
     );
@@ -263,7 +274,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     });
     ShortVideoRepo.save(platform, _videos);
     ShortVideoRepo.markDeleted(platform, [video.key]);
-    await ShortVideoMediaCache.remove(video);
+    if (!ShortVideoPlaylistRepo.contains('short:${video.key}')) {
+      await ShortVideoMediaCache.remove(video);
+    }
+    ShortVideoAutoCache.refreshProtection();
     _offerUndo([video], [position < 0 ? _videos.length : position]);
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
@@ -278,7 +292,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final confirmed = await showConfirmDialog(
       context: context,
       title: Text('删除所选的 ${targets.length} 条？'),
-      content: const Text('本地缓存文件会一起删掉，下次同步时远端那份也会被排除。'),
+      content: const Text(
+        '播放列表里还留着的条目会保留本地视频文件，'
+        '下次同步时远端那份也会被排除。',
+      ),
     );
     if (!confirmed || !mounted) return;
     final positions = <int>[
@@ -294,8 +311,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     ShortVideoRepo.save(platform, _videos);
     ShortVideoRepo.markDeleted(platform, targets.map((e) => e.key));
     for (final video in targets) {
-      await ShortVideoMediaCache.remove(video);
+      if (!ShortVideoPlaylistRepo.contains('short:${video.key}')) {
+        await ShortVideoMediaCache.remove(video);
+      }
     }
+    ShortVideoAutoCache.refreshProtection();
     _offerUndo(targets, [
       for (final position in positions)
         position < 0 ? _videos.length : position,
@@ -340,6 +360,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _status = '已恢复 ${removed.length} 条，本地 ${_videos.length} 条';
     });
     ShortVideoRepo.save(platform, _videos);
+    ShortVideoAutoCache.schedule();
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
 
@@ -357,13 +378,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       title: const Text('清空本地缓存？'),
       content: Text(
         '会删掉已经下到本机的 ${_fmtBytes(_cacheBytes)} 视频文件。'
-        '收藏列表和 WebDAV 上的记录不受影响，下次播放会重新下载。',
+        '收藏列表和 WebDAV 上的记录不受影响，收藏与播放列表里的视频会自动补回。',
       ),
     );
     if (!confirmed || !mounted) return;
     await ShortVideoMediaCache.clear();
     await _refreshCacheSize();
-    if (mounted) SmartDialog.showToast('缓存已清空');
+    ShortVideoAutoCache.schedule();
+    if (mounted) SmartDialog.showToast('缓存已清空，正在自动补回收藏');
   }
 
   /// 把选中的条目整条下到本地。
@@ -379,6 +401,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('正在缓存中');
       return;
     }
+    ShortVideoAutoCache.refreshProtection();
     setState(() => _caching = true);
     var ok = 0;
     var skipped = 0;
@@ -466,6 +489,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('这些已经在播放列表里了');
       return;
     }
+    ShortVideoAutoCache.schedule();
     SmartDialog.showToast(
       '已加入播放列表（共 ${ShortVideoPlaylistRepo.length} 条）',
     );

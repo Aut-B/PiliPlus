@@ -1,11 +1,11 @@
+import 'dart:async' show unawaited;
 import 'dart:convert';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
-import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
 /// 播放列表里的一条。
@@ -149,6 +149,13 @@ class PlaylistItem {
 abstract final class ShortVideoPlaylistRepo {
   static const String _key = 'shortVideoPlaylist';
 
+  static void Function()? onChanged;
+
+  static void _notifyChanged() {
+    final callback = onChanged;
+    if (callback != null) callback();
+  }
+
   static List<PlaylistItem> load() {
     try {
       final Object? raw = GStorage.localCache.get(_key, defaultValue: '');
@@ -186,13 +193,17 @@ abstract final class ShortVideoPlaylistRepo {
       current.add(item);
       added++;
     }
-    if (added > 0) save(current);
+    if (added > 0) {
+      save(current);
+      _notifyChanged();
+    }
     return added;
   }
 
   static void remove(String key) {
     final current = load()..removeWhere((e) => e.key == key);
     save(current);
+    _notifyChanged();
   }
 
   /// 按原位置插回去（删除后的「撤销」用）。
@@ -201,12 +212,16 @@ abstract final class ShortVideoPlaylistRepo {
     final at = index.clamp(0, current.length);
     current.insert(at, item);
     save(current);
+    _notifyChanged();
   }
 
   /// 这份列表里有没有这一条。
   static bool contains(String key) => load().any((e) => e.key == key);
 
-  static void clear() => save([]);
+  static void clear() {
+    save([]);
+    _notifyChanged();
+  }
 
   static int get length => load().length;
 }
@@ -246,10 +261,11 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
       SmartDialog.showToast('列表里没有可播放的条目');
       return;
     }
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: entries,
-        index: start.clamp(0, entries.length - 1),
+    unawaited(
+      openShortVideoQueue(
+        entries,
+        start.clamp(0, entries.length - 1),
+        replaceCurrent: true,
       ),
     );
   }
@@ -267,6 +283,7 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
     final item = next.removeAt(from);
     next.insert(to, item);
     ShortVideoPlaylistRepo.save(next);
+    ShortVideoPlaylistRepo.onChanged?.call();
     setState(() => _items = next);
   }
 

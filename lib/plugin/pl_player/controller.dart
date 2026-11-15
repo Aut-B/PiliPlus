@@ -20,7 +20,7 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/media_diag.dart';
@@ -2384,7 +2384,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (entries.isEmpty) return;
     // isInterrupt: 不主动让出音频焦点，交给新页面接手，中间别出现一段静音。
     unawaited(pause(isInterrupt: true));
-    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
+    unawaited(
+      openShortVideoQueue(entries, 0, replaceCurrent: true),
+    );
   }
 
   /// 暂停播放

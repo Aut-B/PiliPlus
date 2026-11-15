@@ -12,6 +12,8 @@ import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/models/common/theme/theme_color_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/pages/douyin/qa.dart';
+import 'package:PiliPlus/pages/douyin/auto_cache.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/router/app_pages.dart';
 import 'package:PiliPlus/services/account_service.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
@@ -110,6 +112,9 @@ void main() async {
     CacheManager.ensureInitialized(),
     ?FontUtils.init(),
   ]);
+  ShortVideoAutoCache.refreshProtection();
+  ShortVideoPlaylistRepo.onChanged = ShortVideoAutoCache.schedule;
+  ShortVideoAutoCache.schedule();
   Get
     ..lazyPut(AccountService.new)
     ..lazyPut(DownloadService.new);

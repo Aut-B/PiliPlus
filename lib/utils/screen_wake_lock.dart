@@ -12,24 +12,30 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 /// 最后一个持有者放手时才真正关掉。
 abstract final class ScreenWakeLock {
   static final Set<Object> _owners = <Object>{};
+  static Future<void> _pending = Future<void>.value();
+
+  static void _sync() {
+    _pending = _pending.then((_) async {
+      final shouldHold = _owners.isNotEmpty;
+      try {
+        if (shouldHold) {
+          await WakelockPlus.enable();
+        } else {
+          await WakelockPlus.disable();
+        }
+      } catch (_) {}
+    });
+  }
 
   /// 登记一个持有者。重复调用是幂等的。
   static void acquire(Object owner) {
     if (!_owners.add(owner)) return;
-    unawaited(
-      WakelockPlus.enable().catchError((Object _) => Future<void>.value()),
-    );
+    _sync();
   }
 
   /// 注销一个持有者。只有全部注销之后才真正放开常亮。
   static void release(Object owner) {
     if (!_owners.remove(owner)) return;
-    if (_owners.isEmpty) {
-      unawaited(
-        WakelockPlus.disable().catchError(
-          (Object _) => Future<void>.value(),
-        ),
-      );
-    }
+    _sync();
   }
 }

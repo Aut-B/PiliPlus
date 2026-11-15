@@ -26,17 +26,58 @@ class ShortVideoDownload {
 abstract final class ShortVideoMediaCache {
   static Directory? _dir;
 
+  static Future<void> _migration = Future<void>.value();
+
   /// 正在下载的条目，避免同一条被并发拉两遍。
   static final Set<String> _inFlight = {};
+
+  /// 收藏夹 / 播放列表里这些 key 对应的文件不参与容量淘汰。
+  static Set<String> _protectedKeys = const <String>{};
 
   static Future<Directory> _ensureDir() async {
     final cached = _dir;
     if (cached != null && await cached.exists()) return cached;
-    final dir = Directory('$tmpDirPath${Platform.pathSeparator}short_video');
+    final dir = Directory(
+      '$appSupportDirPath${Platform.pathSeparator}short_video',
+    );
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
+    _migration = _migration.then((_) => _migrateLegacyCache(dir));
+    await _migration;
     return _dir = dir;
+  }
+
+  static Future<void> _migrateLegacyCache(Directory target) async {
+    final legacy = Directory(
+      '$tmpDirPath${Platform.pathSeparator}short_video',
+    );
+    if (!await legacy.exists()) return;
+    await for (final entity in legacy.list()) {
+      if (entity is! File) continue;
+      if (entity.path.endsWith('.part')) continue;
+      final destination = File(
+        '${target.path}${Platform.pathSeparator}'
+        '${entity.uri.pathSegments.last}',
+      );
+      if (await destination.exists()) continue;
+      try {
+        await entity.copy(destination.path);
+      } catch (_) {}
+    }
+  }
+
+  /// 刷新受保护 key；后台自动下载完成后调用，避免刚抓到的收藏被 _prune 删掉。
+  static void protect(Iterable<String> keys) {
+    _protectedKeys = keys.toSet();
+  }
+
+  static String _fileKeyOf(String fileName) {
+    if (!fileName.endsWith('.mp4')) return '';
+    final name = fileName.substring(0, fileName.length - 4);
+    final separator = name.indexOf('_');
+    if (separator <= 0) return '';
+    return '${name.substring(0, separator)}:${name.substring(separator + 1)}';
   }
 
   static Future<File> _fileFor(ShortVideo video) async {
@@ -72,6 +113,7 @@ abstract final class ShortVideoMediaCache {
     String appUserAgent = '',
     void Function(double progress)? onProgress,
   }) async {
+    await _ensureDir();
     // 串行下载：低内存机型上并发下载会把进程顶掉，CDN 也会限速。
     return _serialized(
       () => _download(
@@ -250,10 +292,14 @@ abstract final class ShortVideoMediaCache {
           final size = await entity.length();
           final at = await entity.lastModified();
           total += size;
-          entries.add((file: entity, at: at, size: size));
+          final key = _fileKeyOf(entity.uri.pathSegments.last);
+          if (!_protectedKeys.contains(key)) {
+            entries.add((file: entity, at: at, size: size));
+          }
         } catch (_) {}
       }
       if (total <= limit) return;
+      if (entries.isEmpty) return;
       entries.sort((a, b) => a.at.compareTo(b.at));
       for (final entry in entries) {
         if (total <= limit) break;

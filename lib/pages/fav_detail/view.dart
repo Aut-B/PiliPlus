@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:PiliPlus/common/widgets/button/icon_button.dart';
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/common/widgets/flutter/pop_scope.dart';
@@ -10,7 +12,7 @@ import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/models/common/fav_order_type.dart';
 import 'package:PiliPlus/models_new/fav/fav_detail/media.dart';
 import 'package:PiliPlus/models_new/fav/fav_folder/list.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/dynamics_repost/view.dart';
@@ -337,7 +339,9 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
       return;
     }
     _favDetailController.handleSelect();
-    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
+    unawaited(
+      openShortVideoQueue(entries, 0, replaceCurrent: true),
+    );
   }
 
   /// 把选中的 B 站视频插到「下一首播放」。

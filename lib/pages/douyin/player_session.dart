@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:math';
 
 import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
@@ -68,7 +69,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   bool? _autoPipArmedValue;
   Object? _nativePipModeFor;
   String? _nativePipMode;
-  String? _nativePipRunIdCached;
+  String? _nativePipRunId;
   bool _foregroundPipStartInFlight = false;
   bool _pipStartOrdered = false;
   int _pipStartGeneration = 0;
@@ -88,15 +89,19 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     defaultValue: true,
   );
 
+  bool get _forceShortVideoAutoPiP => PipQaConfig.active != null || autoPiP;
+  bool get isManualQaMode => pipQaMode == 'manual';
+
+  String? _pipRecoveryRunId;
+
   bool get ready => !_disposed && player != null && controller != null;
   bool get pipHold => _iosPipHold;
-  String get pipQaMode => PipQaConfig.active?.pipMode ?? 'system';
+  String get pipQaMode =>
+      PipQaConfig.active?.effectiveNativePipMode ??
+      PipQaConfig.defaultPipMode;
 
-  String get _effectiveNativePipMode =>
-      PipQaConfig.active?.effectiveNativePipMode ?? 'system';
-
-  String get _nativePipRunId =>
-      PipQaConfig.active?.nativePipRunId ?? 'short-video-system';
+  String get _nativePipQaRunId =>
+      PipQaConfig.active?.runId ?? 'short-video-default';
 
   Future<void> ensureReady() {
     if (_disposed) return Future<void>.value();
@@ -273,28 +278,24 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     required bool reuseCachedArm,
   }) async {
     if (!bypassGuard && (_foregroundPipStartInFlight || pipActive)) return;
-    final qaConfig = PipQaConfig.active;
-    final armedValue = qaConfig != null || autoPiP;
-    final nativeMode = _effectiveNativePipMode;
-    final nativeRunId = _nativePipRunId;
+    final armedValue = !isManualQaMode;
+    final nativeMode = pipQaMode;
+    final nativeRunId = _nativePipQaRunId;
     if (reuseCachedArm &&
         identical(_autoPipArmedFor, current) &&
         _autoPipArmedValue == armedValue &&
         identical(_nativePipModeFor, current) &&
         _nativePipMode == nativeMode &&
-        _nativePipRunIdCached == nativeRunId) {
+        _nativePipRunId == nativeRunId) {
       return;
     }
     try {
-      await _applyNativePipMode(current, nativeMode, nativeRunId);
       await forceOverlayOff();
       await _forcePipDanmakuOff(current);
+      await _applyNativePipMode(current, nativeMode, nativeRunId);
       await current.setAutoEnterPictureInPicture(armedValue);
       _autoPipArmedFor = current;
       _autoPipArmedValue = armedValue;
-      _nativePipModeFor = current;
-      _nativePipMode = nativeMode;
-      _nativePipRunIdCached = nativeRunId;
     } catch (_) {}
   }
 
@@ -303,11 +304,17 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     String mode,
     String runId,
   ) async {
+    if (!Platform.isIOS ||
+        (identical(_nativePipModeFor, current) &&
+            _nativePipMode == mode &&
+            _nativePipRunId == runId)) {
+      return;
+    }
     try {
-      await (current as dynamic).setPictureInPictureQaMode(
-        mode,
-        runId: runId,
-      );
+      await current.setPictureInPictureQaMode(mode, runId: runId);
+      _nativePipModeFor = current;
+      _nativePipMode = mode;
+      _nativePipRunId = runId;
     } catch (_) {}
   }
 
@@ -329,13 +336,13 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     if (!Platform.isIOS || !ready) return;
     final current = controller!;
     try {
-      await _applyNativePipMode(
-        current,
-        _effectiveNativePipMode,
-        _nativePipRunId,
-      );
       await forceOverlayOff();
       await _forcePipDanmakuOff(current);
+      await _applyNativePipMode(
+        current,
+        pipQaMode,
+        _nativePipQaRunId,
+      );
       await current.preparePictureInPictureForNewMedia();
     } catch (_) {}
   }
@@ -504,11 +511,13 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     if (state == AppLifecycleState.inactive) {
       if (playing) _setWakeLock(true);
       _startBackgroundWindow();
+      _recoverPiPOnBackground('app-inactive');
       return;
     }
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       _releaseWakeLockNow();
       _startBackgroundWindow();
+      _recoverPiPOnBackground('app-${state.name}');
       return;
     }
     if (state == AppLifecycleState.resumed) {
@@ -516,6 +525,33 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
       unawaited(_endBackgroundSample());
       unawaited(_onResumed());
     }
+  }
+
+  void _recoverPiPOnBackground(String reason) {
+    if (!Platform.isIOS || !ready || !playing || pipActive) return;
+    if (!_forceShortVideoAutoPiP) return;
+    final runId = _nativePipQaRunId;
+    if (_pipRecoveryRunId == runId) return;
+    _pipRecoveryRunId = runId;
+    _recordLifecycle('$reason-arm');
+    unawaited(
+      armPip(force: true).then((_) {
+        if (!ready || !playing || pipActive || appState == 'resumed') return;
+        Future<void>.delayed(
+          const Duration(milliseconds: 350 + Random().nextInt(250)),
+          () {
+            if (_disposed || !ready || !playing || pipActive) return;
+            if (appState == 'resumed') return;
+            _recordLifecycle('$reason-start');
+            unawaited(
+              _startPipFromForegroundBiliLike().then((_) {
+                _pipRecoveryRunId = null;
+              }),
+            );
+          },
+        );
+      }),
+    );
   }
 
   void _startBackgroundWindow() {
@@ -625,7 +661,12 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   Future<void> _restorePage() async {
     if (queue.isEmpty) return;
     if (Get.currentRoute == ShortVideoPlayerRoute.routeName) return;
-    await openShortVideoQueue(queue, index, showImmediately: true);
+    await openShortVideoQueue(
+      queue,
+      index,
+      showImmediately: true,
+      replaceCurrent: true,
+    );
   }
 
   Future<void> reportPlayerError(String message) {
@@ -661,6 +702,11 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     await player?.dispose();
     player = null;
     controller = null;
+    _autoPipArmedFor = null;
+    _autoPipArmedValue = null;
+    _nativePipModeFor = null;
+    _nativePipMode = null;
+    _nativePipRunId = null;
     pipActive = false;
   }
 
