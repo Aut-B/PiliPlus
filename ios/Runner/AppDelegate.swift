@@ -1116,6 +1116,30 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    if call.method == "read" {
+      let name = (call.arguments as? [String: Any])?["name"] as? String ?? "pip_qa.json"
+      let safeName = name
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "..", with: "_")
+      let mediaPath = (Self.mediaDir as NSString).appendingPathComponent(safeName)
+      if let text = try? String(contentsOfFile: mediaPath, encoding: .utf8) {
+        result(text)
+        return
+      }
+      if let docs = NSSearchPathForDirectoriesInDomains(
+        .documentDirectory,
+        .userDomainMask,
+        true
+      ).first {
+        let path = (docs as NSString).appendingPathComponent(safeName)
+        if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+          result(text)
+          return
+        }
+      }
+      result(nil)
+      return
+    }
     guard call.method == "write" else {
       result(FlutterMethodNotImplemented)
       return

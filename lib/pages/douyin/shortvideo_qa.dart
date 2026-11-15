@@ -7,6 +7,7 @@ import 'package:PiliPlus/build_config.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
+import 'package:PiliPlus/pages/douyin/qa_config.dart';
 import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -70,14 +71,27 @@ abstract final class ShortVideoQa {
     final signature = ShortVideoShuffleStore.signatureOf(keys);
     final saved = await ShortVideoShuffleStore.load();
     final played = saved?.played.where(keys.toSet().contains).toList() ?? const [];
+    final pip = await _readPipSummary();
+    final realSequence = <String>[
+      for (final key in (pip.remove('sequence') as List?) ?? const [])
+        '$key',
+    ];
     final shuffle = <String, Object?>{
       'queueSize': keys.length,
       'persistedPlayed': played.length,
       'signatureMatch': saved == null ? null : saved.signature == signature,
       'algorithmNoRepeatInRound': _simulateRounds(keys),
+      // 真机实际播放顺序（来自 pip_qa_log 的 displayedKey 采样），
+      // 不是纸上模拟：同一轮里重复出现就直接判失败。
+      'realSequenceLength': realSequence.length,
+      'realDistinctKeys': realSequence.toSet().length,
+      'realNoRepeat': _noRepeatWithinRound(realSequence, keys.length),
+      'realEvidence': realSequence.length >= 2,
+      'realSequence': realSequence.length > 80
+          ? realSequence.sublist(realSequence.length - 80)
+          : realSequence,
     };
 
-    final pip = await _readPipSummary();
     final playStats = ShortVideoPlayStats.snapshot();
     final tiktokPlayed = (playStats['tiktokLocalHits'] as int? ?? 0) +
         (playStats['tiktokNetworkFallbacks'] as int? ?? 0);
@@ -110,10 +124,16 @@ abstract final class ShortVideoQa {
       'pip': pip,
       'verdict': <String, Object?>{
         'cacheComplete': videos.isNotEmpty && local == videos.length,
-        'tiktokLocalPlayable': tiktokTotal == 0 || tiktokLocal > 0,
-        'shuffleNoRepeat': shuffle['algorithmNoRepeatInRound'] == true &&
-            (saved == null || shuffle['signatureMatch'] == true),
-        'pipBackground': pip['positionAdvanced'] == true,
+        // TikTok 收藏必须整批都能离线播，只中一条不算过。
+        'tiktokLocalPlayable':
+            tiktokTotal == 0 || tiktokLocal == tiktokTotal,
+        'shuffleNoRepeat': keys.length <= 1 ||
+            (shuffle['algorithmNoRepeatInRound'] == true &&
+                shuffle['realEvidence'] == true &&
+                shuffle['realNoRepeat'] == true),
+        // pip_qa_log.json 的最终判定由原生 PiP 证据算出（pass/verdict），
+        // 不是这里再猜一遍。
+        'pipBackground': (pip['pass'] ?? pip['passed']) == true,
       },
     };
     await _write(result);
@@ -147,8 +167,25 @@ abstract final class ShortVideoQa {
     return true;
   }
 
+  /// 真机播放顺序里，同一条只要在一轮（= 队列长度）之内又出现，就算重复。
+  /// 距离等于轮长是下一轮的第一条，允许。
+  static bool _noRepeatWithinRound(List<String> sequence, int round) {
+    if (round <= 1) return true;
+    final lastSeen = <String, int>{};
+    for (var i = 0; i < sequence.length; i++) {
+      final key = sequence[i];
+      final previous = lastSeen[key];
+      if (previous != null && i - previous < round) return false;
+      lastSeen[key] = i;
+    }
+    return true;
+  }
+
   static Future<Map<String, Object?>> _readPipSummary() async {
-    final summary = <String, Object?>{'logFound': false};
+    final summary = <String, Object?>{
+      'logFound': false,
+      'configSource': PipQaConfig.source,
+    };
     try {
       final dir = await getApplicationDocumentsDirectory();
       final file = File('${dir.path}/pip_qa_log.json');
@@ -156,7 +193,15 @@ abstract final class ShortVideoQa {
       final decoded = jsonDecode(await file.readAsString());
       if (decoded is! Map) return summary;
       summary['logFound'] = true;
+      final activeRunId = PipQaConfig.active?.runId;
+      if (activeRunId != null &&
+          '${decoded['runId'] ?? ''}' != activeRunId) {
+        // 上一轮的日志不能当成本轮证据。
+        summary['staleRunId'] = decoded['runId'];
+        return summary;
+      }
       for (final key in const [
+        'pass',
         'passed',
         'verdict',
         'backgroundSeconds',
@@ -166,6 +211,17 @@ abstract final class ShortVideoQa {
         'failures',
       ]) {
         if (decoded.containsKey(key)) summary[key] = decoded[key];
+      }
+      final samples = decoded['samples'];
+      if (samples is List) {
+        final sequence = <String>[];
+        for (final sample in samples) {
+          if (sample is! Map) continue;
+          final key = '${sample['displayedKey'] ?? ''}'.trim();
+          if (key.isEmpty || key == 'null') continue;
+          if (sequence.isEmpty || sequence.last != key) sequence.add(key);
+        }
+        summary['sequence'] = sequence;
       }
     } catch (_) {}
     return summary;

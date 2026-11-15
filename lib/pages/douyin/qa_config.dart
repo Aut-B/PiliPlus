@@ -17,6 +17,7 @@ class PipQaConfig {
     this.autoStart = true,
     this.pipMode = defaultPipMode,
     this.seedKeys = const <String>[],
+    this.shuffle = false,
   });
 
   factory PipQaConfig.fromJson(Map<String, dynamic> json) {
@@ -33,6 +34,7 @@ class PipQaConfig {
       advanceEvery: (json['advanceEvery'] as num?)?.toInt() ?? 0,
       autoStart: json['autoStart'] != false,
       pipMode: _normalizePipMode(json['pipMode']),
+      shuffle: json['shuffle'] == true,
       seedKeys:
           (json['seedKeys'] as List?)
               ?.map((value) => '$value')
@@ -49,6 +51,7 @@ class PipQaConfig {
   final int advanceEvery;
   final bool autoStart;
   final String pipMode;
+  final bool shuffle;
   final List<String> seedKeys;
 
   static String _normalizePipMode(Object? value) {
@@ -80,6 +83,9 @@ class PipQaConfig {
 
   /// 当前进程正在执行的 QA 配置；会驱动自动 QA 启动、采样与判定收尾。
   static PipQaConfig? active;
+
+  /// Where the active config came from: `host` or `documents`.
+  static String? source;
 
   static const String fileName = 'pip_qa.json';
   static const String logFileName = 'pip_qa_log.json';

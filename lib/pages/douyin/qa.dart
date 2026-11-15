@@ -17,13 +17,59 @@ export 'package:PiliPlus/pages/douyin/qa_config.dart'
     show PipQaConfig;
 
 /// 读取真机自动 QA 配置。
+/// QA config injected from the host: build time (`--dart-define`) or launch
+/// time (`--env`). Both skip the phone UI entirely, so a USB-only harness can
+/// drive the player without tapping anything.
+const String _pipQaConfigDefine = String.fromEnvironment('PIP_QA_CONFIG');
+
 Future<PipQaConfig?> loadPipQaConfig() async {
   if (!Platform.isIOS) return null;
+  final fromHost = _configFromHost(
+    _pipQaConfigDefine.isNotEmpty
+        ? _pipQaConfigDefine
+        : Platform.environment['PIP_QA_CONFIG'],
+  );
+  if (fromHost != null) {
+    PipQaConfig.source = 'host';
+    return fromHost;
+  }
+  // TrollStore 安装的包没有 installd 记录，house_arrest 会
+  // InstallationLookupFailed，写不进 Documents。原生侧仍然能读写
+  // /private/var/mobile/Media/piliplus_qa/，所以优先走这条通道。
+  try {
+    final raw = await const MethodChannel('PiliPlus/QaDump').invokeMethod<String>(
+      'read',
+      <String, Object?>{'name': PipQaConfig.fileName},
+    );
+    final fromMedia = _configFromHost(raw);
+    if (fromMedia != null) {
+      PipQaConfig.source = 'media';
+      return fromMedia;
+    }
+  } catch (_) {}
   try {
     final dir = await getApplicationDocumentsDirectory();
     final file = File('${dir.path}/${PipQaConfig.fileName}');
     if (!await file.exists()) return null;
     final decoded = jsonDecode(await file.readAsString());
+    if (decoded is! Map) return null;
+    final config = PipQaConfig.fromJson(decoded.cast<String, dynamic>());
+    if (!config.enabled) return null;
+    PipQaConfig.source = 'documents';
+    return config;
+  } catch (_) {
+    return null;
+  }
+}
+
+PipQaConfig? _configFromHost(String? raw) {
+  final text = raw?.trim() ?? '';
+  if (text.isEmpty) return null;
+  try {
+    final jsonText = text.startsWith('{')
+        ? text
+        : utf8.decode(base64.decode(text));
+    final decoded = jsonDecode(jsonText);
     if (decoded is! Map) return null;
     final config = PipQaConfig.fromJson(decoded.cast<String, dynamic>());
     return config.enabled ? config : null;
@@ -65,6 +111,7 @@ Future<void> startPipQaIfRequested(PipQaConfig? config) async {
     ),
   );
   if (config == null || !config.autoStart) return;
+  if (await _qaAlreadyRan(config)) return;
   PipQaRuntime.begin(config);
   ShortVideoSession.instance.resetPipQaCounters();
   try {
@@ -124,6 +171,34 @@ Future<void> _finishQaWithFailure(
   PipQaRuntime.fail(verdict);
   await PipQaRecorder.writeFailure(config, verdict);
   PipQaRuntime.markFinished();
+  await _markQaRan(config);
+}
+
+Future<File?> _qaMarker(PipQaConfig config) async {
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/pip_qa_done_${config.runId}.json');
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<bool> _qaAlreadyRan(PipQaConfig config) async {
+  final file = await _qaMarker(config);
+  return file != null && await file.exists();
+}
+
+Future<void> _markQaRan(PipQaConfig config) async {
+  try {
+    final file = await _qaMarker(config);
+    await file?.writeAsString(
+      jsonEncode(<String, Object?>{
+        'runId': config.runId,
+        'at': DateTime.now().toIso8601String(),
+      }),
+      flush: true,
+    );
+  } catch (_) {}
 }
 
 Future<void> _drivePipQaLifecycle(PipQaConfig config) async {
@@ -192,6 +267,7 @@ Future<void> _drivePipQaLifecycle(PipQaConfig config) async {
     ),
     onTimeout: () => Future<void>.value(),
   );
+  await _markQaRan(config);
   final failure = PipQaRuntime.failureVerdict;
   if (failure != null && !PipQaRuntime.isFinished) {
     await _finishQaWithFailure(config, failure);

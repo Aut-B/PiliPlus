@@ -391,6 +391,10 @@ final Set<String> _shufflePlayed = {};
       );
       return;
     }
+    if (config.shuffle && _mode != ShortVideoLoopMode.shuffle) {
+      _mode = ShortVideoLoopMode.shuffle;
+      _resetShuffleBag();
+    }
     _qaRecorder?.close();
     final recorder = PipQaRecorder(
       config,
