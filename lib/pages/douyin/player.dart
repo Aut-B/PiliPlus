@@ -10,6 +10,7 @@ import 'package:PiliPlus/pages/douyin/player_session.dart';
 import 'package:PiliPlus/pages/douyin/qa_config.dart';
 import 'package:PiliPlus/pages/douyin/qa_recorder.dart';
 import 'package:PiliPlus/pages/douyin/qa_verdict.dart';
+import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
@@ -139,9 +140,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   int _videoHeight = 0;
 
   final Random _shuffleRandom = Random();
-  List<String> _shuffleDeck = const [];
-  String _shuffleQueueSignature = '';
-  final Set<String> _shufflePlayed = {};
+List<String> _shuffleDeck = const [];
+String _shuffleQueueSignature = '';
+String _shuffleSignature = '';
+final Set<String> _shufflePlayed = {};
 
   bool _ready = false;
 
@@ -278,6 +280,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           );
         _index = _clampedIndex(_session.index);
       }
+      await _restoreShuffleHistory();
+      if (!mounted) return;
       _publishSessionState();
       _playing = _session.playing;
       _ready = _session.ready;
@@ -822,6 +826,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         ShortVideoPlatform.douyin;
     final local = await ShortVideoMediaCache.localPath(video);
     if (local != null) {
+      ShortVideoPlayStats.noteLocal(
+        video.key,
+        tiktok: video.platform == 'tiktok',
+      );
       return QueueMedia(
         url: local,
         userAgent: platform.userAgent,
@@ -1117,6 +1125,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       final index = _indexOfKey(key);
       if (index < 0) continue;
       _shufflePlayed.add(key);
+      _persistShuffle();
       return index;
     }
     final fallbackIndex = _queue.indexWhere(
@@ -1124,26 +1133,34 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
     if (fallbackIndex < 0) return _displayedIndex;
     _shufflePlayed.add(_queue[fallbackIndex].key);
+    _persistShuffle();
     return fallbackIndex;
   }
 
   void _startShuffleRound() {
     final currentKey = _current.key;
-    final keys = _queue
-        .map((entry) => entry.key)
-        .where((key) => key != currentKey)
+    final allKeys = _queue.map((entry) => entry.key).toList();
+    var remaining = allKeys
+        .where(
+          (key) => key != currentKey && !_shufflePlayed.contains(key),
+        )
         .toList();
-    keys.shuffle(_shuffleRandom);
-    _shuffleDeck = keys;
-    _shufflePlayed
-      ..clear()
-      ..add(currentKey);
+    if (remaining.isEmpty) {
+      // 这一轮已经播完：清空历史重新开一轮，不能刚重启就一直重复。
+      _shufflePlayed.clear();
+      remaining = allKeys.where((key) => key != currentKey).toList();
+    }
+    remaining.shuffle(_shuffleRandom);
+    _shuffleDeck = remaining;
+    _shufflePlayed.add(currentKey);
+    _persistShuffle();
   }
 
   void _resetShuffleBag() {
     _shuffleDeck = const [];
     _shuffleQueueSignature = '';
     _shufflePlayed.clear();
+    unawaited(ShortVideoShuffleStore.clear());
   }
 
   void _syncShuffleQueue() {
@@ -1153,6 +1170,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _shuffleDeck = _shuffleDeck.where(knownKeys.contains).toList();
     _shufflePlayed.retainWhere(knownKeys.contains);
     _shuffleQueueSignature = signature;
+    _shuffleSignature = ShortVideoShuffleStore.signatureOf(knownKeys);
   }
 
   void _markShufflePlayed(String key) {
@@ -1160,6 +1178,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_shufflePlayed.add(key)) {
       _shuffleDeck.remove(key);
     }
+    _persistShuffle();
+  }
+
+  /// 退出播放页 / 杀进程后仍要记得这一轮播到哪了。
+  Future<void> _restoreShuffleHistory() async {
+    _syncShuffleQueue();
+    final saved = await ShortVideoShuffleStore.load();
+    if (saved == null || !mounted) return;
+    if (saved.signature != _shuffleSignature) return;
+    final knownKeys = _queue.map((entry) => entry.key).toSet();
+    final restored = saved.played.where(knownKeys.contains);
+    if (restored.isEmpty) return;
+    _shufflePlayed.addAll(restored);
+    _shuffleDeck = _shuffleDeck
+        .where((key) => !_shufflePlayed.contains(key))
+        .toList();
+  }
+
+  void _persistShuffle() {
+    final signature = _shuffleSignature;
+    if (signature.isEmpty) return;
+    unawaited(
+      ShortVideoShuffleStore.save(
+        signature: signature,
+        played: _shufflePlayed,
+      ),
+    );
   }
 
   Future<void> _jump(int delta) async {

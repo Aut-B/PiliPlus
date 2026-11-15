@@ -1,4 +1,4 @@
-import 'dart:async' show unawaited;
+import 'dart:async' show Timer, unawaited;
 
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
@@ -9,11 +9,19 @@ import 'package:PiliPlus/pages/douyin/web.dart';
 
 /// 收藏 / 播放列表的后台落盘器。
 ///
-/// 签名直链会过期，TikTok 尤其容易隔天就 403；只有本地文件才算「随时能播的收藏」。
-/// 这里串行把抓到或同步到的条目补下到持久目录，不阻塞收藏页刷新。
+/// 签名直链会过期，TikTok 尤其容易隔天就 403；只有本地文件才算「随时能播的
+/// 收藏」。这里串行把抓到的条目补下到持久目录，不阻塞收藏页刷新。
 abstract final class ShortVideoAutoCache {
   static bool _running = false;
   static bool _pending = false;
+  static Timer? _retryTimer;
+
+  /// 每条失败次数：坏条目不能无限重试把电和流量耗光。
+  static final Map<String, int> _attempts = {};
+  static const int maxAttempts = 8;
+
+  static int lastFailed = 0;
+  static int lastDoneAt = 0;
 
   static List<ShortVideo> collectVideos() {
     final byKey = <String, ShortVideo>{
@@ -26,7 +34,7 @@ abstract final class ShortVideoAutoCache {
     return byKey.values.toList(growable: false);
   }
 
-  /// 先更新保护名单再单独下载：下载成功后会顺手清理不受保护的旧文件。
+  /// 先更新保护名单再单独下载：下载成功后顺手清理不受保护的旧文件。
   static void refreshProtection() {
     ShortVideoMediaCache.protect(
       collectVideos().map((video) => video.key),
@@ -49,33 +57,74 @@ abstract final class ShortVideoAutoCache {
   }
 
   static Future<void> _run() async {
-    try {
-      final all = collectVideos();
-      ShortVideoMediaCache.protect(all.map((video) => video.key));
-      for (final video in all) {
-        if (await ShortVideoMediaCache.localPath(video) != null) continue;
-        final platform =
-            ShortVideoPlatform.fromId(video.platform) ??
-            ShortVideoPlatform.douyin;
-        final cookie = await ShortVideoWeb.cookieHeader(
-          platform.cookieDomainNeedle,
-        );
-        await ShortVideoMediaCache.download(
-          video,
-          urls: <String>[
-            if (video.playUrl.isNotEmpty) video.playUrl,
-            ...stableUrls(video),
-          ],
-          userAgent: platform.userAgent,
-          referer: platform.referer,
-          cookie: cookie,
-          appUserAgent: platform == ShortVideoPlatform.tiktok
-              ? tiktokAppUserAgent
-              : '',
-        );
+    final all = collectVideos();
+    ShortVideoMediaCache.protect(all.map((video) => video.key));
+    var failed = 0;
+    for (final video in all) {
+      // 单条失败绝不能中断整批：以前一个 403 会让后面的收藏全部不下。
+      try {
+        if (await ShortVideoMediaCache.localPath(video) != null) {
+          _attempts.remove(video.key);
+          continue;
+        }
+        if ((_attempts[video.key] ?? 0) >= maxAttempts) continue;
+        if (!await _fetchOne(video)) failed++;
+      } catch (_) {
+        _bump(video.key);
+        failed++;
       }
-    } catch (_) {
-      return;
     }
+    lastFailed = failed;
+    lastDoneAt = DateTime.now().millisecondsSinceEpoch;
+    if (failed > 0) _scheduleRetry();
   }
+
+  static Future<bool> _fetchOne(ShortVideo video) async {
+    final platform =
+        ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
+    final cookie = await ShortVideoWeb.cookieHeader(
+      platform.cookieDomainNeedle,
+    );
+    final stable = stableUrls(video);
+    final urls = <String>[
+      // TikTok 的长期地址优先；签名直链兜底。
+      if (platform == ShortVideoPlatform.tiktok) ...stable,
+      if (video.playUrl.isNotEmpty) video.playUrl,
+      if (platform != ShortVideoPlatform.tiktok) ...stable,
+    ];
+    final result = await ShortVideoMediaCache.download(
+      video,
+      urls: urls,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      cookie: cookie,
+      appUserAgent: platform == ShortVideoPlatform.tiktok
+          ? tiktokAppUserAgent
+          : '',
+    );
+    if (result.ok) {
+      _attempts.remove(video.key);
+      return true;
+    }
+    _bump(video.key);
+    return false;
+  }
+
+  static void _bump(String key) {
+    _attempts.update(key, (value) => value + 1, ifAbsent: () => 1);
+  }
+
+  static void _scheduleRetry() {
+    _retryTimer?.cancel();
+    _retryTimer = Timer(const Duration(seconds: 90), schedule);
+  }
+
+  static Map<String, Object?> snapshot() => <String, Object?>{
+    'running': _running,
+    'pending': _pending,
+    'failed': lastFailed,
+    'doneAt': lastDoneAt,
+    'retryEntries': _attempts.length,
+    'attempts': Map<String, int>.of(_attempts),
+  };
 }

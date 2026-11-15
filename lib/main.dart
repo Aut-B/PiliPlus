@@ -14,6 +14,7 @@ import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/pages/douyin/qa.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
+import 'package:PiliPlus/pages/douyin/shortvideo_qa.dart';
 import 'package:PiliPlus/router/app_pages.dart';
 import 'package:PiliPlus/services/account_service.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
@@ -115,6 +116,7 @@ void main() async {
   ShortVideoAutoCache.refreshProtection();
   ShortVideoPlaylistRepo.onChanged = ShortVideoAutoCache.schedule;
   ShortVideoAutoCache.schedule();
+  ShortVideoQa.schedule();
   Get
     ..lazyPut(AccountService.new)
     ..lazyPut(DownloadService.new);

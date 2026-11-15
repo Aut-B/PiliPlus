@@ -88,6 +88,37 @@ class QueueMedia {
   final String cookie;
 }
 
+/// 播放来源计数：给自动体检判断「TikTok 是不是真的先走本地」。
+abstract final class ShortVideoPlayStats {
+  static int localHits = 0;
+  static int networkFallbacks = 0;
+  static int tiktokLocalHits = 0;
+  static int tiktokNetworkFallbacks = 0;
+  static final Set<String> localKeys = <String>{};
+  static final Set<String> networkKeys = <String>{};
+
+  static void noteLocal(String key, {required bool tiktok}) {
+    localHits++;
+    localKeys.add(key);
+    if (tiktok) tiktokLocalHits++;
+  }
+
+  static void noteNetwork(String key, {required bool tiktok}) {
+    networkFallbacks++;
+    networkKeys.add(key);
+    if (tiktok) tiktokNetworkFallbacks++;
+  }
+
+  static Map<String, Object?> snapshot() => <String, Object?>{
+    'localHits': localHits,
+    'networkFallbacks': networkFallbacks,
+    'tiktokLocalHits': tiktokLocalHits,
+    'tiktokNetworkFallbacks': tiktokNetworkFallbacks,
+    'localKeys': localKeys.toList(growable: false),
+    'networkKeys': networkKeys.toList(growable: false),
+  };
+}
+
 /// 「下一首播放」的临时插队队列。
 ///
 /// 播放页里排的是它自己那份队列（B 站收藏、抖音收藏各一份），两边互不相识。
@@ -157,6 +188,10 @@ Future<QueueMedia?> resolveQueueEntry(
 Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
   final local = await ShortVideoMediaCache.localPath(video);
   if (local != null) {
+    ShortVideoPlayStats.noteLocal(
+      video.key,
+      tiktok: video.platform == 'tiktok',
+    );
     return QueueMedia(
       url: local,
       userAgent: '',
@@ -168,9 +203,14 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
       ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
   final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
-  if (!fresh) {
+  // TikTok 的签名直链即使「看起来新」也经常 403，所以永远先探长期地址。
+  if (!fresh || platform == ShortVideoPlatform.tiktok) {
     final stable = await _probeStable(video, platform, cookie);
     if (stable != null) {
+      ShortVideoPlayStats.noteNetwork(
+        video.key,
+        tiktok: platform == ShortVideoPlatform.tiktok,
+      );
       return QueueMedia(
         url: stable,
         userAgent: platform == ShortVideoPlatform.tiktok
@@ -182,6 +222,10 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
     }
   }
   if (video.playUrl.isNotEmpty) {
+    ShortVideoPlayStats.noteNetwork(
+      video.key,
+      tiktok: platform == ShortVideoPlatform.tiktok,
+    );
     return QueueMedia(
       url: video.playUrl,
       userAgent: platform.userAgent,
@@ -191,6 +235,10 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
   }
   final stable = await _probeStable(video, platform, cookie);
   if (stable == null) return null;
+  ShortVideoPlayStats.noteNetwork(
+    video.key,
+    tiktok: platform == ShortVideoPlatform.tiktok,
+  );
   return QueueMedia(
     url: stable,
     userAgent: platform == ShortVideoPlatform.tiktok
