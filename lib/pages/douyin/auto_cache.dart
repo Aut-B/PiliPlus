@@ -20,6 +20,10 @@ abstract final class ShortVideoAutoCache {
   static final Map<String, int> _attempts = {};
   static const int maxAttempts = 8;
 
+  /// 每条最后一次失败原因。以前只有「0/37」这种数字，看不出是 403、
+  /// 网页当视频、还是地址全空；把原因带进体检结果才能定位。
+  static final Map<String, String> _errors = {};
+
   static int lastFailed = 0;
   static int lastDoneAt = 0;
 
@@ -104,9 +108,14 @@ abstract final class ShortVideoAutoCache {
     );
     if (result.ok) {
       _attempts.remove(video.key);
+      _errors.remove(video.key);
       return true;
     }
     _bump(video.key);
+    final reason = (result.error ?? 'unknown').trim();
+    _errors[video.key] = reason.length > 160
+        ? reason.substring(0, 160)
+        : reason;
     return false;
   }
 
@@ -126,5 +135,6 @@ abstract final class ShortVideoAutoCache {
     'doneAt': lastDoneAt,
     'retryEntries': _attempts.length,
     'attempts': Map<String, int>.of(_attempts),
+    'errors': Map<String, String>.of(_errors),
   };
 }

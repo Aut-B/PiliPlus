@@ -212,6 +212,14 @@ abstract final class ShortVideoMediaCache {
       final request = await client.getUrl(Uri.parse(url));
       request.headers.set(HttpHeaders.userAgentHeader, userAgent);
       request.headers.set(HttpHeaders.refererHeader, referer);
+      // TikTok 的 CDN（v16-webapp-prime 等）在没有 Range / Accept 时经常直接
+      // 回 403 或者一整页 HTML；抖音这边带上也无害。
+      request.headers.set(HttpHeaders.acceptHeader, '*/*');
+      request.headers.set(
+        HttpHeaders.acceptLanguageHeader,
+        'en-US,en;q=0.9,zh-CN;q=0.8',
+      );
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
       if (cookie.isNotEmpty) {
         request.headers.set(HttpHeaders.cookieHeader, cookie);
       }
