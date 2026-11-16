@@ -3,6 +3,7 @@ import Foundation
 import CoreFoundation
 import UIKit
 import WebKit
+import Darwin
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
@@ -13,6 +14,9 @@ import WebKit
     application.applicationSupportsShakeToEdit = false // Disable shake to undo
     PipQaHostLifecycle.shared.start()
     QaDumpPlugin.captureLaunchConfig()
+    if PipQaSelfInstall.handleLaunchRequestIfNeeded() {
+      return true
+    }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -1093,6 +1097,256 @@ final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
       UIApplication.shared.open(url, options: [:], completionHandler: nil)
     }
     decisionHandler(.cancel)
+  }
+}
+
+// MARK: - 自装卸（借 TrollStore 的 root helper）
+
+/// `posix_spawnattr_set_persona_*` 是 XNU 的私有接口，TrollStore 用它把子进程
+/// 拉进 system persona 从而拿到 uid 0（见 TSUtil.m 的 `spawnRoot`）。
+/// SDK 没有声明，只能自己挂上符号。
+private let pipPersonaFlagsOverride: UInt32 = 1
+
+@_silgen_name("posix_spawnattr_set_persona_np")
+private func pipSpawnattrSetPersona(
+  _ attr: UnsafeMutableRawPointer?,
+  _ persona: uid_t,
+  _ flags: UInt32
+) -> Int32
+
+@_silgen_name("posix_spawnattr_set_persona_uid_np")
+private func pipSpawnattrSetPersonaUid(
+  _ attr: UnsafeMutableRawPointer?,
+  _ uid: uid_t
+) -> Int32
+
+@_silgen_name("posix_spawnattr_set_persona_gid_np")
+private func pipSpawnattrSetPersonaGid(
+  _ attr: UnsafeMutableRawPointer?,
+  _ gid: uid_t
+) -> Int32
+
+/// 让 App 自己换掉自己。
+///
+/// TrollStore 的安装动作全部收在 `TrollStore.app/trollstorehelper` 里，但那个
+/// 二进制第一行就要求 `getuid()==0`。TrollStore 自己能调用它，是因为它用
+/// persona 覆盖把子进程拉成 root；本 App 带 CI 里那份
+/// `com.apple.private.persona-mgmt` 之后可以复刻同样的动作，
+/// 于是「推包 → 安装 → 重开」这条链路不需要人再点 TrollStore。
+///
+/// 触发方式：启动参数 `-PIPQA <base64/json>` 或 Media 目录下的 `pip_qa.json`
+/// 里带 `installIpa`。装完把结果写 `self_install.json` 再退出，宿主脚本
+/// 轮询 CFBundleVersion 变化后重新拉起新包。
+enum PipQaSelfInstall {
+  static let mediaDir = "/private/var/mobile/Media/piliplus_qa"
+  static let reportName = "self_install.json"
+
+  private struct SpawnOutcome {
+    let spawnError: Int32
+    let status: Int32
+    let output: String
+    let personaNotes: String
+  }
+
+  static func handleLaunchRequestIfNeeded() -> Bool {
+    guard let raw = launchConfigRaw(),
+          let config = configDictionary(raw),
+          let ipa = (config["installIpa"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !ipa.isEmpty
+    else {
+      return false
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      var report: [String: Any] = [
+        "at": ISO8601DateFormatter().string(from: Date()),
+        "ipa": ipa,
+      ]
+      guard let helper = helperPath() else {
+        report["ok"] = false
+        report["error"] = "trollstore-helper-not-found"
+        writeReport(report)
+        exit(2)
+      }
+      report["helper"] = helper
+      // helper 会先删旧包再放新包，本进程随时可能被杀，先把「已开始」落盘，
+      // 宿主脚本据此区分「没进安装流程」和「装到一半挂了」。
+      var startedReport = report
+      startedReport["stage"] = "started"
+      writeReport(startedReport)
+      let started = Date()
+      let outcome = spawnAsRoot(
+        helper,
+        // 不能带 skip-uicache：helper 里 skipUICache 会连带跳过 registerPath，
+        // 新包放进去也不会被 LaunchServices 认到。
+        ["install", "force", ipa]
+      )
+      report["spawnError"] = Int(outcome.spawnError)
+      report["exit"] = Int(outcome.status)
+      report["persona"] = outcome.personaNotes
+      report["output"] = String(outcome.output.suffix(4000))
+      report["seconds"] = Int(Date().timeIntervalSince(started))
+      // 182/184 是 helper 的「非致命」返回码（需要开发者模式 / 含加密扩展二进制）。
+      let ok = outcome.spawnError == 0
+        && (outcome.status == 0 || outcome.status == 182 || outcome.status == 184)
+      report["ok"] = ok
+      writeReport(report)
+      exit(ok ? 0 : 3)
+    }
+    return true
+  }
+
+  private static func launchConfigRaw() -> String? {
+    if let raw = QaDumpPlugin.launchConfigRaw, !raw.isEmpty {
+      return raw
+    }
+    let path = (mediaDir as NSString).appendingPathComponent("pip_qa.json")
+    return try? String(contentsOfFile: path, encoding: .utf8)
+  }
+
+  private static func configDictionary(_ raw: String) -> [String: Any]? {
+    let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    var jsonText = text
+    if !text.hasPrefix("{"),
+       let data = Data(base64Encoded: text),
+       let decoded = String(data: data, encoding: .utf8) {
+      jsonText = decoded
+    }
+    guard let data = jsonText.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          let dict = object as? [String: Any]
+    else {
+      return nil
+    }
+    return dict
+  }
+
+  private static func helperPath() -> String? {
+    let manager = FileManager.default
+    for root in [
+      "/var/containers/Bundle/Application",
+      "/private/var/containers/Bundle/Application",
+    ] {
+      guard let items = try? manager.contentsOfDirectory(atPath: root) else {
+        continue
+      }
+      for item in items {
+        let path = "\(root)/\(item)/TrollStore.app/trollstorehelper"
+        if manager.isExecutableFile(atPath: path) {
+          return path
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func spawnAsRoot(
+    _ path: String,
+    _ arguments: [String]
+  ) -> SpawnOutcome {
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    var personaError: Int32 = -1
+    var uidError: Int32 = -1
+    var gidError: Int32 = -1
+    withUnsafeMutablePointer(to: &attr) { pointer in
+      let raw = UnsafeMutableRawPointer(pointer)
+      personaError = pipSpawnattrSetPersona(raw, 99, pipPersonaFlagsOverride)
+      uidError = pipSpawnattrSetPersonaUid(raw, 0)
+      gidError = pipSpawnattrSetPersonaGid(raw, 0)
+    }
+    let notes = "persona=\(personaError),uid=\(uidError),gid=\(gidError)"
+
+    var pipeFDs: [Int32] = [0, 0]
+    guard pipe(&pipeFDs) == 0 else {
+      posix_spawnattr_destroy(&attr)
+      return SpawnOutcome(
+        spawnError: -1, status: -1, output: "pipe() failed", personaNotes: notes
+      )
+    }
+
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
+    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
+    posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
+    posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
+
+    var argv: [String] = [path]
+    argv.append(contentsOf: arguments)
+    var cargs = argv.map { strdup($0) }
+    cargs.append(nil)
+
+    var pid: pid_t = 0
+    let spawnError = cargs.withUnsafeMutableBufferPointer { buffer in
+      posix_spawn(&pid, path, &actions, &attr, buffer.baseAddress, environ)
+    }
+    posix_spawn_file_actions_destroy(&actions)
+    posix_spawnattr_destroy(&attr)
+    for case let pointer? in cargs {
+      free(pointer)
+    }
+
+    close(pipeFDs[1])
+    guard spawnError == 0 else {
+      close(pipeFDs[0])
+      return SpawnOutcome(
+        spawnError: spawnError,
+        status: -1,
+        output: String(cString: strerror(spawnError)),
+        personaNotes: notes
+      )
+    }
+
+    var collected = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+      let read = buffer.withUnsafeMutableBytes {
+        Darwin.read(pipeFDs[0], $0.baseAddress, $0.count)
+      }
+      if read <= 0 { break }
+      collected.append(contentsOf: buffer[0..<read])
+    }
+    close(pipeFDs[0])
+
+    var rawStatus: Int32 = 0
+    waitpid(pid, &rawStatus, 0)
+    let exited = (rawStatus & 0x7f) == 0
+    let status = exited ? (rawStatus >> 8) & 0xff : -1
+    return SpawnOutcome(
+      spawnError: 0,
+      status: status,
+      output: String(decoding: collected, as: UTF8.self),
+      personaNotes: notes
+    )
+  }
+
+  private static func writeReport(_ report: [String: Any]) {
+    guard let data = try? JSONSerialization.data(
+            withJSONObject: report, options: [.sortedKeys]
+          ),
+          let text = String(data: data, encoding: .utf8)
+    else {
+      return
+    }
+    var wrote: [String] = []
+    try? FileManager.default.createDirectory(
+      atPath: mediaDir, withIntermediateDirectories: true
+    )
+    let mediaPath = (mediaDir as NSString).appendingPathComponent(reportName)
+    if (try? text.write(toFile: mediaPath, atomically: true, encoding: .utf8)) != nil {
+      wrote.append(mediaPath)
+    }
+    if let docs = NSSearchPathForDirectoriesInDomains(
+      .documentDirectory, .userDomainMask, true
+    ).first {
+      let path = (docs as NSString).appendingPathComponent(reportName)
+      if (try? text.write(toFile: path, atomically: true, encoding: .utf8)) != nil {
+        wrote.append(path)
+      }
+    }
+    NSLog("[PIPQA] self_install %@", text)
+    NSLog("[PIPQA] self_install wrote %@", wrote.joined(separator: ","))
   }
 }
 
