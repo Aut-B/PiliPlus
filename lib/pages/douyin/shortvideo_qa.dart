@@ -76,8 +76,10 @@ abstract final class ShortVideoQa {
       for (final key in (pip.remove('sequence') as List?) ?? const [])
         '$key',
     ];
+    final roundSize = (pip.remove('queueTotal') as int?) ?? keys.length;
     final shuffle = <String, Object?>{
       'queueSize': keys.length,
+      'roundSize': roundSize,
       'persistedPlayed': played.length,
       'signatureMatch': saved == null ? null : saved.signature == signature,
       'algorithmNoRepeatInRound': _simulateRounds(keys),
@@ -85,7 +87,7 @@ abstract final class ShortVideoQa {
       // 不是纸上模拟：同一轮里重复出现就直接判失败。
       'realSequenceLength': realSequence.length,
       'realDistinctKeys': realSequence.toSet().length,
-      'realNoRepeat': _noRepeatWithinRound(realSequence, keys.length),
+      'realNoRepeat': _noRepeatWithinRound(realSequence, roundSize),
       'realEvidence': realSequence.length >= 2,
       'realSequence': realSequence.length > 80
           ? realSequence.sublist(realSequence.length - 80)
@@ -215,13 +217,16 @@ abstract final class ShortVideoQa {
       final samples = decoded['samples'];
       if (samples is List) {
         final sequence = <String>[];
+        var queueTotal = 0;
         for (final sample in samples) {
           if (sample is! Map) continue;
+          queueTotal = (sample['total'] as num?)?.toInt() ?? queueTotal;
           final key = '${sample['displayedKey'] ?? ''}'.trim();
           if (key.isEmpty || key == 'null') continue;
           if (sequence.isEmpty || sequence.last != key) sequence.add(key);
         }
         summary['sequence'] = sequence;
+        summary['queueTotal'] = queueTotal;
       }
     } catch (_) {}
     return summary;

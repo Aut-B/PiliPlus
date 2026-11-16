@@ -12,6 +12,7 @@ import WebKit
   ) -> Bool {
     application.applicationSupportsShakeToEdit = false // Disable shake to undo
     PipQaHostLifecycle.shared.start()
+    QaDumpPlugin.captureLaunchConfig()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -1107,6 +1108,24 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
   static let mediaDir = "/private/var/mobile/Media/piliplus_qa"
   private static let chunkSize = 600
 
+  /// 启动参数里带进来的 QA 配置。
+  ///
+  /// TrollStore 安装的包拿不到 house_arrest，`/private/var/mobile/Media`
+  /// 又需要额外权限，因此 `dvt launch 'bundle -PIPQA {json}'` 是最短的一条
+  /// 配置送达通道：不需要重打包，也不需要 App 有沙盒外权限。
+  static private(set) var launchConfigRaw: String?
+
+  static func captureLaunchConfig() {
+    let arguments = ProcessInfo.processInfo.arguments
+    if let index = arguments.firstIndex(of: "-PIPQA"), index + 1 < arguments.count {
+      let raw = arguments[index + 1]
+      launchConfigRaw = raw
+      NSLog("[PIPQA] launch config bytes=\(raw.utf8.count)")
+    } else {
+      NSLog("[PIPQA] no -PIPQA launch arg, argc=\(arguments.count)")
+    }
+  }
+
   static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
       name: channelName,
@@ -1116,6 +1135,10 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    if call.method == "launchConfig" {
+      result(Self.launchConfigRaw)
+      return
+    }
     if call.method == "read" {
       let name = (call.arguments as? [String: Any])?["name"] as? String ?? "pip_qa.json"
       let safeName = name
@@ -1137,6 +1160,7 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
           return
         }
       }
+      NSLog("[PIPQA] read miss: \(safeName) (media+documents)")
       result(nil)
       return
     }

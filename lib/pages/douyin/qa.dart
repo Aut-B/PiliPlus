@@ -14,13 +14,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart';
 
 export 'package:PiliPlus/pages/douyin/qa_config.dart'
-    show PipQaConfig;
+    show PipQaConfig, PipQaRuntime;
 
 /// 读取真机自动 QA 配置。
 /// QA config injected from the host: build time (`--dart-define`) or launch
 /// time (`--env`). Both skip the phone UI entirely, so a USB-only harness can
 /// drive the player without tapping anything.
 const String _pipQaConfigDefine = String.fromEnvironment('PIP_QA_CONFIG');
+const MethodChannel _qaDumpChannel = MethodChannel('PiliPlus/QaDump');
 
 Future<PipQaConfig?> loadPipQaConfig() async {
   if (!Platform.isIOS) return null;
@@ -33,11 +34,23 @@ Future<PipQaConfig?> loadPipQaConfig() async {
     PipQaConfig.source = 'host';
     return fromHost;
   }
+  // 启动参数（`dvt launch 'bundle -PIPQA {json}'`）。
+  //
+  // 这条通道不需要 App 有任何沙盒外权限，也不需要重打包，是 TrollStore 包
+  // 最稳的一条配置送达路径：env 在部分系统版本上不会进 `Platform.environment`。
+  try {
+    final raw = await _qaDumpChannel.invokeMethod<String>('launchConfig');
+    final fromLaunch = _configFromHost(raw);
+    if (fromLaunch != null) {
+      PipQaConfig.source = 'launch';
+      return fromLaunch;
+    }
+  } catch (_) {}
   // TrollStore 安装的包没有 installd 记录，house_arrest 会
   // InstallationLookupFailed，写不进 Documents。原生侧仍然能读写
   // /private/var/mobile/Media/piliplus_qa/，所以优先走这条通道。
   try {
-    final raw = await const MethodChannel('PiliPlus/QaDump').invokeMethod<String>(
+    final raw = await _qaDumpChannel.invokeMethod<String>(
       'read',
       <String, Object?>{'name': PipQaConfig.fileName},
     );
@@ -60,6 +73,23 @@ Future<PipQaConfig?> loadPipQaConfig() async {
   } catch (_) {
     return null;
   }
+}
+
+/// 把「这一轮 QA 是怎么启动的」落盘。
+///
+/// 之前几轮体检都是「脚本以为启动了、App 其实没进播放页」，而现场只有一张
+/// 首页截图。开机诊断固定写到 `qa_boot.json`（Media 目录 + Documents + NSLog
+/// 三条通道），失败时也写，能直接区分「配置没送到」「收藏为空」「导航抛异常」。
+Future<void> dumpQaBoot(Map<String, Object?> payload) async {
+  try {
+    await _qaDumpChannel.invokeMethod<List<Object?>>('write', <String, Object?>{
+      'name': 'qa_boot.json',
+      'content': jsonEncode(<String, Object?>{
+        'at': DateTime.now().toIso8601String(),
+        ...payload,
+      }),
+    });
+  } catch (_) {}
 }
 
 PipQaConfig? _configFromHost(String? raw) {

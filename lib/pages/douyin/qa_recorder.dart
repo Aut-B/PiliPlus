@@ -6,6 +6,7 @@ import 'package:PiliPlus/build_config.dart';
 import 'package:PiliPlus/pages/douyin/player_session.dart';
 import 'package:PiliPlus/pages/douyin/qa_config.dart';
 import 'package:PiliPlus/pages/douyin/qa_verdict.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 typedef PipQaStateBuilder = Map<String, Object?> Function();
@@ -22,6 +23,35 @@ typedef PipQaHostDiagLoader = Future<Map<String, Object?>> Function({
 Future<void> _pipQaWriteQueue = Future<void>.value();
 int _pipQaWriteSequence = 0;
 int _pipQaFinalSequence = 0;
+DateTime? _lastMediaMirrorAt;
+
+/// 把诊断日志镜像到 `/private/var/mobile/Media/piliplus_qa/`。
+///
+/// Documents 里的文件在 TrollStore 包上取不回来（house_arrest 需要 installd
+/// 记录），所以每次诊断都必须往 AFC 能直接拉的那条路径再写一份。为了不把
+/// NSLog 分段通道刷爆，非收尾写入按 20 秒节流。
+Future<void> _mirrorPipQaLog(
+  String content, {
+  required bool finalWrite,
+}) async {
+  final now = DateTime.now();
+  final last = _lastMediaMirrorAt;
+  if (!finalWrite &&
+      last != null &&
+      now.difference(last) < const Duration(seconds: 20)) {
+    return;
+  }
+  _lastMediaMirrorAt = now;
+  try {
+    await const MethodChannel('PiliPlus/QaDump').invokeMethod<List<Object?>>(
+      'write',
+      <String, Object?>{
+        'name': PipQaConfig.logFileName,
+        'content': content,
+      },
+    );
+  } catch (_) {}
+}
 
 Map<String, Object?> _foregroundPipStartEvidence(PipQaConfig config) {
   final session = ShortVideoSession.instance;
@@ -50,7 +80,9 @@ Future<void> _writePipQaLog(
     }
     final dir = await getApplicationDocumentsDirectory();
     final file = File('${dir.path}/${PipQaConfig.logFileName}');
-    await file.writeAsString(jsonEncode(payload), flush: true);
+    final content = jsonEncode(payload);
+    await file.writeAsString(content, flush: true);
+    await _mirrorPipQaLog(content, finalWrite: finalWrite);
   }).catchError((Object _) => Future<void>.value());
   return _pipQaWriteQueue;
 }

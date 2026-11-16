@@ -227,8 +227,27 @@ void main() async {
 
 Future<void> _startPipQa() async {
   try {
-    await startPipQaIfRequested(await loadPipQaConfig());
-  } catch (_) {}
+    final config = await loadPipQaConfig();
+    await dumpQaBoot(<String, Object?>{
+      'stage': 'config',
+      'source': PipQaConfig.source,
+      'runId': config?.runId,
+      'enabled': config?.enabled,
+      'autoStart': config?.autoStart,
+      'pipMode': config?.pipMode,
+      'envHasConfig':
+          (Platform.environment['PIP_QA_CONFIG'] ?? '').isNotEmpty,
+      'defineHasConfig': const String.fromEnvironment('PIP_QA_CONFIG').isNotEmpty,
+    });
+    await startPipQaIfRequested(config);
+    await dumpQaBoot(<String, Object?>{
+      'stage': 'started',
+      'runId': config?.runId,
+      'started': PipQaRuntime.isStarted,
+    });
+  } catch (error) {
+    await dumpQaBoot(<String, Object?>{'stage': 'error', 'error': '$error'});
+  }
 }
 
 KeyEventResult _onKeyEvent(KeyEvent event) {
